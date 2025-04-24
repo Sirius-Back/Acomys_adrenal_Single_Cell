@@ -1,0 +1,1781 @@
+---
+title: "acomys_vs_mouse_integration"
+author: "Andrey Bydanov"
+date: "2024-12-12"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+```{r}
+library(pagoda2)
+library(Seurat)
+#install.packages("Seurat")
+
+#remove.packages("Seurat")
+#install.packages("SeuratObject")
+library(SeuratObject)
+library(Seurat)
+
+# if (!requireNamespace("BiocManager", quietly = TRUE))
+#   install.packages("BiocManager")
+
+#BiocManager::install("conos")
+#library(conos)
+library(ggplot2)
+library(cowplot)
+#BiocManager::install("openxlsx")
+library(openxlsx)
+library(ggpubr)
+library(tidyverse)
+library(patchwork)
+# 
+# if (!requireNamespace("BiocManager", quietly = TRUE))
+#   install.packages("BiocManager")
+
+#BiocManager::install("scuttle")
+library(scuttle)
+library(foreach)
+library(parallel)
+
+# if (!requireNamespace("devtools", quietly = TRUE))
+#   install.packages("devtools")
+# 
+#devtools::install_github("SatijaLab/SeuratWrappers")
+#remotes::install_github('satijalab/seurat-wrappers')
+#remotes::install_github('satijalab/seurat-wrappers@community-vignette')
+
+library(SeuratWrappers)
+#library(ggplot2)
+#library(patchwork)
+options(future.globals.maxSize = 1e9)
+options(Seurat.object.assay.version = "v5")
+#remotes::install_github('satijalab/seurat-wrappers')
+# 
+# if (!requireNamespace("BiocManager", quietly = TRUE))
+#   install.packages("BiocManager")
+
+#BiocManager::install("celda")
+library(celda)
+```
+
+
+```{r}
+library(Seurat)
+
+if (!require("BiocManager", quietly = TRUE))
+    install.packages("BiocManager")
+
+#BiocManager::install("scDblFinder")
+
+library(scDblFinder)
+
+#BiocManager::install("decontX")
+
+#devtools::install_github("campbio/decontX")
+
+```
+
+Take a look at Acomys data 
+
+```{r, echo=FALSE, fig.height=7, fig.width=12}
+merge_mice
+
+
+FeaturePlot(merge_mice, 
+            features = c("Dcn", "Col1a1", "Shh", "Rspo3"), 
+            reduction = "umap.rpca",
+            label = T, repel = T, 
+            pt.size = 0.9, 
+            label.size = 5, 
+            order = TRUE)
+```
+
+# We need to integrate independently Male and Female samples of Acomys and Mouse
+
+1. 
+
+
+```{r}
+# suppressPackageStartupMessages(library(scDblFinder))
+#remove.packages("decontX")
+#devtools::install_github("campbio/decontX")
+#BiocManager::install("glmGamPoi")
+library(glmGamPoi)
+library(decontX)
+library(scDblFinder)
+
+
+
+acomys <- lapply(sample_list, function(sample) {
+  
+  # Extract raw count matrix
+  raw_counts <- GetAssayData(sample, layer = "counts")
+  
+  # Create new Seurat object with raw matrix
+  so_not_regressed <- CreateSeuratObject(counts = raw_counts)
+  
+  # Perform standard QC
+  so_not_regressed[["percent.mito"]] <- PercentageFeatureSet(so_not_regressed, pattern = "^MT-")
+  so_not_regressed <- subset(so_not_regressed, subset = nFeature_RNA > 200 & percent.mito < 15)
+  
+  # Convert to SingleCellExperiment for DecontX and scDblFinder
+  sce <- as.SingleCellExperiment(so_not_regressed)
+  
+  # Run DecontX for contamination correction
+  sce <- decontX(sce)
+  
+  # Update Seurat object with decontaminated counts
+  decontaminated_counts <- assays(sce)$decontXcounts
+  so_not_regressed <- SetAssayData(so_not_regressed, assay = "RNA", layer = "counts", new.data = decontaminated_counts)
+  
+  # Run scDblFinder for doublet detection
+  sce <- scDblFinder(sce)
+  
+  # Filter out detected doublets
+  so_not_regressed$scDblFinder_class <- sce$scDblFinder.class
+  so_not_regressed <- subset(so_not_regressed, subset = scDblFinder_class == "singlet")
+  
+  # Normalize data using SCTransform version 2
+  so_not_regressed <- SCTransform(so_not_regressed, vst.flavor = "v2", return.only.var.genes = F, verbose = FALSE)
+
+  # Score cell cycle for each cell
+  genes <- rownames(raw_counts)
+  g2m <- cell_cycle_genes[cell_cycle_genes$phase == "G2/M", ]$gene
+  S <- cell_cycle_genes[cell_cycle_genes$phase == "S", ]$gene
+  s.genes <- S[S %in% rownames(so_not_regressed)]
+  g2m.genes <- g2m[g2m %in% rownames(so_not_regressed)]
+  so_not_regressed <- CellCycleScoring(so_not_regressed, s.features = s.genes, g2m.features = g2m.genes, set.ident = TRUE)
+
+  # Run PCA
+  so_not_regressed <- Seurat::RunPCA(so_not_regressed, npcs = 50, verbose = TRUE)
+  
+  # Run UMAP
+  so_not_regressed <- Seurat::RunUMAP(object = so_not_regressed, dims = 1:10, verbose = TRUE)
+  
+  # Set default assay to SCT
+  DefaultAssay(so_not_regressed) <- "SCT"
+  
+  return(so_not_regressed)
+})
+
+```
+
+
+
+```{r}
+
+# pipeline for mouse pericort data
+mice <- lapply(sample_list_pericort, function(sample) {
+  
+  # Extract raw count matrix
+  raw_counts <- GetAssayData(sample, layer = "counts")
+  
+  # Create new Seurat object with raw matrix
+  so_not_regressed <- CreateSeuratObject(counts = raw_counts)
+  
+  # Perform standard QC
+  so_not_regressed[["percent.mito"]] <- PercentageFeatureSet(so_not_regressed, pattern = "^MT-")
+  so_not_regressed <- subset(so_not_regressed, subset = nFeature_RNA > 200 & percent.mito < 15)
+  
+  # Convert to SingleCellExperiment for DecontX and scDblFinder
+  sce <- as.SingleCellExperiment(so_not_regressed)
+  
+  # Run DecontX for contamination correction
+  #sce <- decontX(sce)
+  
+  # Update Seurat object with decontaminated counts
+  #decontaminated_counts <- assays(sce)$decontXcounts
+  #so_not_regressed <- SetAssayData(so_not_regressed, assay = "RNA", slot = "counts", new.data = decontaminated_counts)
+  
+  # Run scDblFinder for doublet detection
+  #sce <- scDblFinder(sce)
+  
+  # Filter out detected doublets
+  #so_not_regressed$scDblFinder_class <- sce$scDblFinder.class
+  #so_not_regressed <- subset(so_not_regressed, subset = scDblFinder_class == "singlet")
+  
+  # Normalize data using SCTransform version 2
+  so_not_regressed <- SCTransform(so_not_regressed, vst.flavor = "v2", return.only.var.genes = F, verbose = FALSE)
+
+  # Score cell cycle for each cell
+  genes <- rownames(raw_counts)
+  g2m <- cell_cycle_genes[cell_cycle_genes$phase == "G2/M", ]$gene
+  S <- cell_cycle_genes[cell_cycle_genes$phase == "S", ]$gene
+  s.genes <- S[S %in% rownames(so_not_regressed)]
+  g2m.genes <- g2m[g2m %in% rownames(so_not_regressed)]
+  so_not_regressed <- CellCycleScoring(so_not_regressed, s.features = s.genes, g2m.features = g2m.genes, set.ident = TRUE)
+
+  # Run PCA
+  so_not_regressed <- Seurat::RunPCA(so_not_regressed, npcs = 50, verbose = TRUE)
+  
+  # Run UMAP
+  so_not_regressed <- Seurat::RunUMAP(object = so_not_regressed, dims = 1:10, verbose = TRUE)
+  
+  # Set default assay to SCT
+  DefaultAssay(so_not_regressed) <- "SCT"
+  
+  return(so_not_regressed)
+})
+
+rm(so_not_regressed)
+```
+
+Female samples to merge: Ac_adreno_female_1, Ac_adreno_female_10, Ac_adreno_female_2, Ac_adreno_female_3, Ac_adreno_female_9,
+                          AdGL_Fe, Ms_AM_F, ol2, Ol_2, Ol_3, GSM4409674, GSM4409675, GSM4409676
+
+Male samples to merge: Ac_adreno_male_4, Ac_adreno_male_5, Ac_adreno_male_6, Ac_adreno_male_7, Ac_adreno_male_8, 
+                        AdGL_Ma, AG_male_ms_2, Ms_AM_M, ol4, meth, GSM4914026, GSM4914027
+
+
+```{r}
+names(mice)
+colnames(mice$al)
+names(acomys)
+```
+
+
+```{r}
+# Compare gene names between human (reannotated) and mouse objects
+human_genes <- rownames(mice$AdGl_Fe)
+mouse_genes <- rownames(acomys$Ac_adreno_female_1)
+
+# Check if they are identical in order and content
+identical(human_genes, mouse_genes)  # Should return TRUE
+
+# Find mismatched genes
+setdiff(human_genes, mouse_genes)
+setdiff(mouse_genes, human_genes)
+```
+
+
+
+```{r}
+# merging male and female samples
+merged_male <- merge(mice$AdGl_Ma, y = c(mice$AG_male_ms_2, mice$Ms_AM_M, mice$ol4, mice$GSM4914026, mice$GSM4914027, acomys$Ac_adreno_male_4, acomys$Ac_adreno_male_5, acomys$Ac_adreno_male_6, acomys$Ac_adreno_male_7, acomys$Ac_adreno_male_8))
+
+merged_female <- merge(mice$AdGl_Fe, y = c(mice$Ms_AM_F, mice$ol2, mice$Ol_2, mice$Ol_3, mice$GSM4409674, mice$GSM4409675, mice$GSM4409676, acomys$Ac_adreno_female_1, acomys$Ac_adreno_female_2, acomys$Ac_adreno_female_3, acomys$Ac_adreno_female_9, acomys$Ac_adreno_female_10))
+
+# merge mice and acomys samples into one object
+# Merge the two objects and add prefixes for cell IDs
+merged_all <- merge(mice$AdGl_Ma, y = c(mice$AG_male_ms_2, mice$Ms_AM_M, mice$ol4, mice$GSM4914026, mice$GSM4914027, acomys$Ac_adreno_male_4, acomys$Ac_adreno_male_5, acomys$Ac_adreno_male_6, acomys$Ac_adreno_male_7, acomys$Ac_adreno_male_8, mice$AdGl_Fe, mice$Ms_AM_F, mice$ol2, mice$Ol_2, mice$Ol_3, mice$GSM4409674, mice$GSM4409675, mice$GSM4409676, acomys$Ac_adreno_female_1, acomys$Ac_adreno_female_2, acomys$Ac_adreno_female_3, acomys$Ac_adreno_female_9, acomys$Ac_adreno_female_10))
+
+
+# Compare features of the first two objects
+sum(rownames(mice$AdGl_Fe) != rownames(acomys$Ac_adreno_female_1))
+
+
+
+
+merged_acomys <- merge(acomys$Ac_adreno_female_1, y = c(acomys$Ac_adreno_female_10, acomys$Ac_adreno_female_2, acomys$Ac_adreno_female_3, 
+                                                        acomys$Ac_adreno_female_9, acomys$Ac_adreno_male_4, acomys$Ac_adreno_male_5, 
+                                                        acomys$Ac_adreno_male_6, acomys$Ac_adreno_male_7, acomys$Ac_adreno_male_8))
+
+
+
+rm(merged_acomys, merged_male, merged_female, merged_all)
+# saving new objects
+saveRDS(merged_acomys, "merged_acomys.RDS")
+saveRDS(merged_male, "merged_male.RDS")
+saveRDS(merged_female, "merged_female.RDS")
+saveRDS(merged_all, "merged_all.RDS")
+```
+```{r}
+# change objecct idents to the orig.idents 
+Idents(merged_acomys) <- merged_acomys$orig.ident
+
+
+
+# run sctransform
+merged_acomys <- SCTransform(merged_acomys, vst.flavor = "v2")
+merged_acomys <- RunPCA(merged_acomys, npcs = 40, verbose = FALSE)
+
+# CCA integration
+merged_acomys <- IntegrateLayers(
+  object = merged_acomys, method = CCAIntegration, assay = "SCT",
+  orig.reduction = "pca", new.reduction = "integrated.cca", normalization.method = "SCT",
+  verbose = TRUE
+)
+
+merged_acomys <- FindNeighbors(merged_acomys, reduction = "integrated.cca", dims = 1:40)
+merged_acomys <- FindClusters(merged_acomys, resolution = 0.08, cluster.name = "cca_clusters")
+merged_acomys <- RunUMAP(merged_acomys, reduction = "integrated.cca", dims = 1:40, reduction.name = "umap.cca")
+
+saveRDS(merged_acomys, "merged_acomys.RDS")
+```
+
+```{r}
+merged_acomys$orig.ident %>%
+  table
+
+# rename orig.idents for female
+cell_ids <- colnames(merged_acomys)
+
+orig_idents <- sub("^(.*)_[^_]+$", "\\1", cell_ids)
+
+orig_idents %>% table 
+
+
+merged_acomys$orig.ident <- orig_idents
+
+table(merged_acomys$orig.ident)
+```
+
+
+```{r}
+DimPlot(merged_acomys, group.by = "orig.ident")
+```
+
+
+
+```{r}
+merged_acomys$cca_clusters %>% table
+```
+
+
+
+```{r}
+CellDimPlot3D(srt = merged_acomys, group.by = "cca_clusters")
+```
+
+
+
+```{r}
+# new one
+merged_all$orig.ident %>% table
+
+```
+
+
+
+# downsampling of Acomys cells down to ~2000
+```{r}
+# Check cell counts by species
+table(merged_all$Species)
+
+target_cells <- 26000
+
+# Subset Acomys cells
+acomys_cells <- colnames(merged_all)[merged_all$Species == "Acomys"]
+
+# Downsample Acomys cells to the target number
+set.seed(123)  # For reproducibility
+downsampled_acomys_cells <- sample(acomys_cells, size = target_cells, replace = FALSE)
+
+# Create a new Seurat object with downsampled Acomys and all Mouse cells
+downsampled_obj <- subset(merged_all, cells = c(downsampled_acomys_cells, colnames(merged_all)[merged_all$Species == "Mouse"]))
+```
+
+```{r}
+df <- data.frame(Samples = c("Acomys", "Mouse"), Counts = c(52688, 25695))
+df
+ggplot(df, aes(x = Samples, y = Counts, fill = Samples)) +
+  geom_bar(stat = "identity")+
+  labs(x = "Species",
+       y = "Number of Cells") 
+```
+
+
+```{r}
+# Check cell counts by species
+table(downsampled_obj$Species)
+
+# Check cell counts by sample
+table(downsampled_obj$orig.ident)
+
+df <- as.data.frame.table(table(downsampled_obj$Species))
+
+# Rename columns for clarity
+colnames(df) <- c("Species", "Count")
+
+ggplot(df, aes(x = Species, y = Count, fill = Species)) +
+  geom_bar(stat = "identity")+
+  labs(x = "Species",
+       y = "Number of Cells") 
+```
+
+
+
+# Saving Seurat objects to scanpy format
+```{r}
+install.packages("SeuratDisk")
+```
+
+
+```{r}
+# IMPORTANT: Reset the default assay to the one containing the raw or SCT normalized data.
+# For example, if you have an SCT assay:
+DefaultAssay(downsampled_obj) <- "SCT"
+```
+
+```{r}
+# integrate our object
+downsampled_obj$orig.ident %>% table
+
+# change objecct idents to the orig.idents 
+Idents(downsampled_obj) <- downsampled_obj$orig.ident
+
+# run sctransform
+downsampled_obj <- SCTransform(downsampled_obj, vst.flavor = "v2")
+downsampled_obj <- RunPCA(downsampled_obj, npcs = 40, verbose = FALSE)
+
+# CCA integration
+downsampled_obj <- IntegrateLayers(
+  object = downsampled_obj, method = CCAIntegration, assay = "SCT",
+  orig.reduction = "pca", new.reduction = "integrated.cca", normalization.method = "SCT",
+  verbose = TRUE
+)
+
+downsampled_obj <- FindNeighbors(downsampled_obj, reduction = "integrated.cca", dims = 1:40)
+downsampled_obj <- FindClusters(downsampled_obj, resolution = 0.3, cluster.name = "cca_clusters")
+downsampled_obj <- RunUMAP(downsampled_obj, reduction = "integrated.cca", dims = 1:40, reduction.name = "umap.cca")
+
+saveRDS(downsampled_obj, "downsampled_obj.RDS")
+```
+
+```{r}
+downsampled_obj$Sex <- ifelse(downsampled_obj$orig.ident %in% c('Ac_adreno_female_1', 'Ac_adreno_female_10',
+                                      'Ac_adreno_female_2', 'Ac_adreno_female_3', 'Ac_adreno_female_9',
+                                      'AdGl_Fe', 'Ms_AM_F', 'ol2', 'Ol_2', 'Ol_3', 
+                                      'GSM4409674', 'GSM4409675', 'GSM4409676'), "Female", "Male")
+
+downsampled_obj@meta.data -> metadata
+
+metadata %>%
+  filter(Sex == 'Male') %>% 
+  select(orig.ident) %>% pull() %>% unique()
+  
+
+metadata %>%
+  filter(Sex == 'Female') %>% 
+  select(orig.ident) %>% pull() %>% unique()
+```
+
+```{r, echo=FALSE, fig.height=5, fig.width=12}
+# umap for downsampled object
+Idents(downsampled_obj) <- downsampled_obj$cca_clusters
+
+DimPlot(downsampled_obj, #split.by = "Species",
+        reduction = "umap.cca",  
+        group.by = c("Sex", "Phase", "Species"),
+        combine = T, label.size = 5, label = F) 
+
+```
+```{r}
+DimPlot(downsampled_obj, split.by = "Species",
+        reduction = "umap.cca",  
+        #group.by = c("Sex", "Phase", "Species"),
+        combine = F, label.size = 5, label = T) 
+```
+
+
+
+```{r, echo=FALSE, fig.height=5, fig.width=12}
+# plot for merged male samples
+n_cells <- downsampled_obj$orig.ident %>% table %>% as.data.frame()
+colnames(n_cells) <- c("Sample", "Count")
+ggplot(n_cells, aes(Sample, Count)) + 
+  geom_col(fill = "#56B4E9") +
+  rotate_x_text(angle = 45) +
+  geom_text(aes(Sample, Count-222), label = n_cells$Count)
+```
+
+
+```{r}
+table(downsampled_obj$Species)
+```
+
+
+```{r}
+# Extract metadata from object A
+metadata_A <- pericort@meta.data
+seurat_clusters_A <- metadata_A$new_annotation
+cells_A <- colnames(pericort)
+
+# Check the head of cell names from A and integrated object
+head(cells_A)
+head(colnames(downsampled_obj))
+
+# Standardize cell names if necessary (example: adding prefix/suffix)
+if (grepl("^sample1_", colnames(downsampled_obj)[1])) {
+    cells_A <- paste0("sample1_", cells_A)
+}
+
+# Find common cells between the two objects
+common_cells <- intersect(cells_A, colnames(downsampled_obj))
+
+# Ensure the seurat_clusters are correctly subsetted for the common cells
+seurat_clusters_common <- seurat_clusters_A[match(common_cells, cells_A)]
+
+# Explicitly convert seurat_clusters_common to character
+seurat_clusters_common <- as.character(seurat_clusters_common)
+
+# Check that seurat_clusters_common has no NAs
+if (sum(is.na(seurat_clusters_common)) > 0) {
+    stop("Mismatch in cell names; some clusters are missing.")
+}
+
+# Create a new column for seurat_clusters if it doesn't exist
+if (!"mice_clusters" %in% colnames(downsampled_obj@meta.data)) {
+    downsampled_obj@meta.data$mice_clusters <- NA
+}
+
+# Convert mice_clusters to character to avoid factor level conflicts
+downsampled_obj@meta.data$mice_clusters <- as.character(downsampled_obj@meta.data$mice_clusters)
+
+# Assign the cluster values to the correct cells
+downsampled_obj@meta.data[common_cells, "mice_clusters"] <- seurat_clusters_common
+
+# Optionally, convert mice_clusters back to a factor
+downsampled_obj@meta.data$mice_clusters <- factor(downsampled_obj@meta.data$mice_clusters)
+
+# Verify the metadata
+head(downsampled_obj@meta.data)
+
+# Replace NAs in mice_clusters column
+library(na.tools)
+downsampled_obj$mice_clusters <- na.replace(downsampled_obj$mice_clusters, "Unknown")
+
+# Check unique values in mice_clusters
+downsampled_obj$mice_clusters %>% unique()
+```
+
+
+
+```{r, echo=FALSE, fig.height=7, fig.width=15}
+#install.packages("cowplot")
+library(cowplot)
+#install.packages("patchwork")
+library(patchwork)
+library(RColorBrewer)
+
+Idents(downsampled_obj) <- downsampled_obj$mice_clusters 
+downsampled_obj$mice_clusters %>% table
+
+DimPlot(downsampled_obj, split.by = "mice_clusters")
+
+downsampled_obj$numeric_labels <- ifelse(
+  downsampled_obj$mice_clusters == "Unknown",  # Condition
+  "Unknown",  # Value if TRUE
+  gsub(":.*", "", downsampled_obj$mice_clusters)  # Value if FALSE
+)
+
+downsampled_obj$numeric_labels %>% table
+
+# Subset the Seurat object to include only the specified clusters
+subset_obj <- subset(downsampled_obj, subset = numeric_labels %in% c("1", "2", "3", "4", "5", "6", "7"))
+subset_obj_2 <- subset(downsampled_obj, subset = numeric_labels %in% c("8", "9", "10", "11", "12", "13", "14"))
+
+# Ensure the clusters are ordered correctly (optional)
+subset_obj$mice_clusters <- factor(subset_obj$numeric_labels, levels = c("1", "2", "3", "4", "5", "6", "7"))
+subset_obj_2$mice_clusters <- factor(subset_obj_2$numeric_labels, levels = c("8", "9", "10", "11", "12", "13", "14"))
+
+
+species_plot <- DimPlot(downsampled_obj, split.by = "Species")
+species_colors <- unique(ggplot_build(species_plot)$data[[1]]$colour)
+
+# rename clusters
+#subset_obj_2$mice_clusters <- recode(as.character(subset_obj_2$mice_clusters), !!!new_annotation)
+#subset_obj_2$mice_clusters %>% unique()
+
+#subset_obj$mice_clusters <- recode(as.character(subset_obj$mice_clusters), !!!new_annotation)
+#subset_obj$mice_clusters %>% unique()
+
+
+# Create p1 with custom colors
+p1 <- DimPlot(subset_obj, split.by = "mice_clusters", cols = species_colors[1:7])
+
+# Create p2 with the same custom colors
+p2 <- DimPlot(subset_obj_2, split.by = "mice_clusters", cols = species_colors[8:14])
+
+#p2 <- DimPlot(merged_all, split.by = "mice_clusters")
+
+
+p1 / p2
+```
+
+
+
+```{r, echo=FALSE, fig.height=7, fig.width=15}
+# clusterization by cca_clusters
+Idents(subset_obj) <- subset_obj$mice_clusters
+Idents(subset_obj_2) <- subset_obj_2$mice_clusters
+
+p3 <- DimPlot(subset_obj, split.by = "cca_clusters")
+p4 <- DimPlot(subset_obj_2, split.by = "cca_clusters")
+
+#p2 <- DimPlot(merged_all, split.by = "mice_clusters")
+
+
+p3 / p4
+
+`%!in%` <- Negate(`%in%`)
+mice_subset <- subset(downsampled_obj, subset = numeric_labels %!in% "Unknown")
+DimPlot(mice_subset, split.by = "cca_clusters")
+```
+
+
+```{r}
+DimPlot(downsampled_obj, split.by = "Species", cols = species_colors)
+```
+
+
+
+```{r}
+devtools::install_github("cellgeni/sceasy")
+
+if (!requireNamespace("BiocManager", quietly = TRUE))
+    install.packages("BiocManager")
+
+BiocManager::install(c("LoomExperiment", "SingleCellExperiment"))
+
+library(sceasy)
+library(reticulate)
+use_condaenv('EnvironmentName')
+#loompy <- reticulate::import('loompy')
+
+sceasy::convertFormat(merged_all, from="seurat", to="anndata",
+                       outFile='merged_all.h5ad')
+```
+
+
+```{r}
+str(merged_all)
+
+options(Seurat.object.assay.version = 'v3')
+merged_all@assays$RNA@meta.features
+
+library(Seurat)
+
+#install.packages("scCustomize")
+
+library(reticulate)
+use_python("/home/bydanov/miniconda3/bin/python3", required = TRUE)
+py_config()
+
+#conda install ncurses
+reticulate::install_python(version = "3.11")
+#reticulate::use_python("/home/bydanov/miniconda3/bin/python3", required = TRUE)
+reticulate::py_config()
+reticulate::py_install("anndata", envname = "r-reticulate")
+
+library(reticulate)
+use_virtualenv("r-reticulate")
+
+Sys.setenv(RETICULATE_PYTHON = "/home/bydanov/miniconda3/bin/python3")
+library(reticulate)
+py_config()
+
+
+reticulate::py_config()
+reticulate::py_module_available("anndata")
+
+
+
+# Load Packages
+library(Seurat)
+library(rliger)
+library(scCustomize)
+library(qs)
+
+DefaultAssay(merged_all) <- "RNA"
+
+dim(merged_all@assays$SCT@counts)  # (genes, cells)
+dim(merged_all@assays$SCT@data)    # (genes, cells)
+dim(merged_all@assays$SCT@scale.data)  # May have different dimensions if variable features are used
+
+
+# integratioin
+
+# run sctransform
+merged_all <- SCTransform(merged_all, vst.flavor = "v2")
+merged_all <- RunPCA(merged_all, npcs = 40, verbose = FALSE)
+
+# RPCA integration
+merged_all <- IntegrateLayers(
+  object = merged_all, method = RPCAIntegration, assay = "SCT",
+  orig.reduction = "pca", new.reduction = "integrated.rpca", normalization.method = "SCT",
+  verbose = TRUE
+)
+
+
+merged_all <- FindNeighbors(merged_all, reduction = "integrated.rpca", dims = 1:40)
+merged_all <- FindClusters(merged_all, resolution = 0.3, cluster.name = "rpca_clusters")
+merged_all <- RunUMAP(merged_all, reduction = "integrated.rpca", dims = 1:40, reduction.name = "umap.rpca")
+
+saveRDS(merged_all, "merged_all_rpca_integrated.RDS")
+
+
+
+# CCA integration
+merged_all <- IntegrateLayers(
+  object = merged_all, method = CCAIntegration, assay = "SCT",
+  orig.reduction = "pca", new.reduction = "integrated.cca", normalization.method = "SCT",
+  verbose = TRUE
+)
+
+#remove.packages("uwot")
+#install.packages("uwot")
+#library(uwot)
+
+merged_all <- FindNeighbors(merged_all, reduction = "integrated.cca", dims = 1:40)
+merged_all <- FindClusters(merged_all, resolution = 0.3, cluster.name = "cca_clusters")
+merged_all <- RunUMAP(merged_all, reduction = "integrated.cca", dims = 1:40, reduction.name = "umap.cca")
+
+
+saveRDS(merged_all, "integrated_merged_all.RDS")
+
+
+
+# save the object in annData format - merged_all
+scCustomize::as.anndata(
+  x = merged_all, 
+  file_path = "/mnt/Baum1/bydanov/Acomys_adrenal_sc/acomys_analysis", 
+  file_name = "merged_all.h5ad", 
+  all.genes = TRUE,
+  assay = "SCT",  
+  main_layer = "data",  # Store normalized expression as the main layer
+  layers = list("counts" = merged_all@assays$RNA@counts)  # Add raw counts as a layer
+)
+
+
+# save downsampled object
+reticulate::py_module_available(module = 'anndata')
+
+# save the object in annData format - downsampled_obj
+scCustomize::as.anndata(
+  x = downsampled_obj, 
+  file_path = "/mnt/Baum1/bydanov/Acomys_adrenal_sc/acomys_analysis", 
+  file_name = "downsampled_obj.h5ad", 
+  all.genes = TRUE,
+  assay = "SCT",  
+  main_layer = "data",  # Store normalized expression as the main layer
+  layers = list("counts" = downsampled_obj@assays$RNA@counts)  # Add raw counts as a layer
+)
+
+```
+
+
+
+We need to check up orig.idents
+```{r}
+merged_all$orig.ident %>%
+  table
+
+# rename orig.idents for female
+cell_ids <- colnames(merged_all)
+
+orig_idents <- sub("^(.*)_[^_]+$", "\\1", cell_ids)
+
+orig_idents %>% table 
+
+
+merged_all$orig.ident <- orig_idents
+
+a <- table(merged_all$orig.ident)
+
+# add Species column
+merged_all$Species <- ifelse(str_detect(merged_all$orig.ident, "Ac_"), "Acomys", "Mouse")
+
+
+# saving new objects
+#saveRDS(merged_all, "merged_all.RDS")
+```
+
+```{r, echo=FALSE, fig.height=5, fig.width=12}
+# plot for merged male samples
+n_cells <- merged_all$orig.ident %>% table %>% as.data.frame()
+colnames(n_cells) <- c("Sample", "Count")
+ggplot(n_cells, aes(Sample, Count)) + 
+  geom_col(fill = "#56B4E9") +
+  rotate_x_text(angle = 45) +
+  geom_text(aes(Sample, Count-222), label = n_cells$Count)
+```
+
+
+```{r, echo=FALSE, fig.height=5, fig.width=10}
+Idents(merged_all) <- merged_all$cca_clusters
+
+DimPlot(merged_all, split.by = "Species",
+        reduction = "umap.cca",  
+        #group.by = c("orig.ident", "Phase", "Species"),
+        combine = FALSE, label.size = 5, label = T) 
+
+```
+
+```{r, echo=FALSE, fig.height=5, fig.width=14}
+DimPlot(merged_all, #group.by = "Sex",
+        reduction = "umap.cca",  
+        group.by = c("Sex", "Phase", "Species"),
+        combine = TRUE, label.size = 5, label = F) 
+```
+
+
+```{r}
+# 
+# Extract metadata from object A
+metadata_A <- pericort@meta.data
+seurat_clusters_A <- metadata_A$seurat_clusters
+cells_A <- colnames(pericort)
+
+# Check the head of cell names from A and integrated object
+head(cells_A)
+head(colnames(merged_all))
+
+# Standardize cell names if necessary (example: adding prefix/suffix)
+if (grepl("^sample1_", colnames(merged_all)[1])) {
+    cells_A <- paste0("sample1_", cells_A)
+}
+
+# Find common cells between the two objects
+common_cells <- intersect(cells_A, colnames(merged_all))
+
+# Ensure the seurat_clusters are correctly subsetted for the common cells
+seurat_clusters_common <- seurat_clusters_A[match(common_cells, cells_A)]
+
+# Check that seurat_clusters_common has no NAs
+if (sum(is.na(seurat_clusters_common)) > 0) {
+    stop("Mismatch in cell names; some clusters are missing.")
+}
+
+# Create a new column for seurat_clusters if it doesn't exist
+if (!"seurat_clusters" %in% colnames(merged_all@meta.data)) {
+    merged_all@meta.data$mice_clusters <- NA
+}
+
+# Assign the cluster values to the correct cells
+merged_all@meta.data[common_cells, "mice_clusters"] <- seurat_clusters_common
+
+# Verify the metadata
+tail(merged_all@meta.data)
+
+#replace NAs in mice_clusters column
+library(na.tools)
+merged_all$mice_clusters <- na.replace(merged_all$mice_clusters, "Unknown")
+
+merged_all$mice_clusters %>% unique()
+```
+
+```{r, echo=FALSE, fig.height=4, fig.width=10}
+Idents(merged_all) <- merged_all$mice_clusters
+
+DimPlot(merged_all, split.by = 'mice_clusters') 
+```
+
+```{r}
+# Install required packages
+if (!requireNamespace("SeuratDisk", quietly = TRUE)) {
+    remotes::install_github("mojaveazure/seurat-disk")
+}
+devtools::install_github("hhoeflin/hdf5r")
+
+install.packages("hdf5r")
+BiocManager::install("rhdf5")
+
+BiocManager::install("rhdf5")
+library(rhdf5)
+#source("http://bioconductor.org/biocLite.R")
+#biocLite("hdf5r")
+
+library(Seurat)
+library(SeuratDisk)
+
+# Extract the RNA assay (unintegrated data) from the integrated object
+unintegrated_counts <- GetAssayData(merged_all, assay = "RNA", layer = "counts")
+
+# Export the count matrix to a CSV file
+write.csv(as.matrix(count_matrix), file = "counts.csv")
+write.csv(merged_all@meta.data, file = "metadata.csv")
+write.csv(rownames(merged_all@assays$RNA@counts), file = "genes.csv")
+```
+
+
+
+
+
+Have a look at cluster composition based on Species
+
+```{r, echo=FALSE, fig.height=5, fig.width=8}
+downsampled_obj@meta.data -> metadata
+
+cluster_composition <- metadata %>%
+  group_by(cca_clusters, Species) %>%
+  summarize(count = dplyr::n()) %>%
+  arrange(desc(count))
+
+metadata %>%
+  group_by(cca_clusters) %>%
+  summarize(count = dplyr::n()) %>%
+  arrange(desc(count)) %>% View()
+
+
+cluster_composition$cca_clusters <- factor(
+  cluster_composition$cca_clusters, 
+  levels = c(0, 1, 2, 3, 4, 5, 6, 7, 8, 9)  
+)
+
+
+cluster_composition <- cluster_composition %>%
+  group_by(cca_clusters) %>%
+  mutate(proportion = count / sum(count))
+
+
+cluster_composition[cluster_composition$cca_clusters == 9, ]
+
+# Visualize compositional data
+ggplot(cluster_composition, aes(as.factor(cca_clusters), count, fill = Species)) +
+  geom_bar(stat = "identity", position = "stack") +
+  geom_text(
+    aes(
+      label = scales::percent(proportion, 1),
+      vjust = ifelse(cca_clusters %in% 7:10 & Species == "Acomys", -0.5, 1.5)  # Adjust vjust for clusters 7–10
+    ),
+    position = position_stack(vjust = 0.5),
+    size = 3, color = "black"
+  ) +
+  labs(
+    title = "Cluster composition by Species within all samples",
+    x = "Cluster", 
+    y = "Cell count",
+    fill = "Species"
+  ) +
+  theme(legend.position = "bottom")
+
+```
+
+
+
+# Let's add Sex metadata column
+```{r}
+merged_all$Sex <- ifelse(merged_all$orig.ident %in% c('Ac_adreno_female_1', 'Ac_adreno_female_10',
+                                      'Ac_adreno_female_2', 'Ac_adreno_female_3', 'Ac_adreno_female_9',
+                                      'AdGl_Fe', 'Ms_AM_F', 'ol2', 'Ol_2', 'Ol_3', 
+                                      'GSM4409674', 'GSM4409675', 'GSM4409676'), "Female", "Male")
+
+merged_all@meta.data -> metadata
+
+metadata %>%
+  filter(Sex == 'Male') %>% 
+  select(orig.ident) %>% pull() %>% unique()
+  
+
+metadata %>%
+  filter(Sex == 'Female') %>% 
+  select(orig.ident) %>% pull() %>% unique()
+```
+
+
+
+
+Have a look at cluster composition based on Sex
+
+```{r, echo=FALSE, fig.height=5, fig.width=8}
+
+cluster_composition_sex <- function(object){
+  object@meta.data -> metadata
+  
+  cluster_composition <- metadata %>%
+    group_by(cca_clusters, Sex) %>%
+    summarize(count = dplyr::n()) %>%
+    arrange(desc(count))
+  
+  unique_clusters <- sort(unique(cluster_composition$cca_clusters))
+  cluster_composition$cca_clusters <- factor(
+    cluster_composition$cca_clusters, 
+    levels = unique_clusters  
+  )
+  
+  
+  cluster_composition <- cluster_composition %>%
+    group_by(cca_clusters) %>%
+    mutate(proportion = count / sum(count))
+  
+  
+  #cluster_composition[cluster_composition$cca_clusters == 9, ]
+  
+  # Visualize compositional data
+  p_sex <- ggplot(cluster_composition, aes(as.factor(cca_clusters), count, fill = Sex)) +
+    geom_bar(stat = "identity", position = "stack") +
+    geom_text(
+      aes(
+        label = scales::percent(proportion, 1),
+        vjust = ifelse(cca_clusters %in% 7:10 & Sex == "Male", -0.5, 1.5)  # Adjust vjust for clusters 7–10
+      ),
+      position = position_stack(vjust = 0.5),
+      size = 3, color = "black"
+    ) +
+    labs(
+      title = "Cluster composition by Sex within all samples",
+      x = "Cluster", 
+      y = "Cell count",
+      fill = "Sex"
+    ) +
+    theme(legend.position = "bottom")
+  return(p_sex)
+}
+```
+
+
+
+
+
+```{r}
+cluster_composition_sex(downsampled_obj)
+```
+
+```{r}
+# Subset male and female objects
+male_obj <- subset(downsampled_obj, subset = Sex == "Male")
+female_obj <- subset(downsampled_obj, subset = Sex == "Female")
+```
+
+```{r}
+# DimPlot for male subset
+DimPlot(male_obj, reduction = "umap.cca", split.by = "Species",
+              label = TRUE, label.size = 5) 
+
+# DimPlot for female subset
+DimPlot(female_obj, reduction = "umap.cca", split.by = "Species",
+              label = TRUE, label.size = 5)
+```
+
+```{r, echo=FALSE, fig.height=5, fig.width=12}
+
+# DimPlot for male subset
+female_acomys <- subset(female_obj, subset = Species == "Acomys")
+female_mouse <- subset(female_obj, subset = Species == "Mouse")
+
+# extract colors from the p1 
+default_colors_p1 <- c("#F8766D", "#DB72FB", "#D39200", "#619CFF", "#00B9E3", "#00C19F", "#00BA38", "#93AA00", "#FF61C3")
+
+default_colors_p2 <- c("#F8766D", "#DB72FB", "#D39200", "#619CFF", "#00B9E3", "#00C19F", "#00BA38", "#93AA00", "#FF61C3", "#E76BF3")
+
+unique(ggplot_build(p2)$data[[1]]$colour)
+
+p1 <- DimPlot(female_acomys, reduction = "umap.cca", split.by = "cca_clusters",
+              label = TRUE, label.size = 5, cols = default_colors_p1)
+
+p2 <- DimPlot(female_mouse, reduction = "umap.cca", split.by = "cca_clusters",
+              label = TRUE, label.size = 5, cols = default_colors_p2)
+
+
+p1 / p2
+```
+
+
+
+```{r, echo=FALSE, fig.height=5, fig.width=12}
+
+# DimPlot for male subset
+male_acomys <- subset(male_obj, subset = Species == "Acomys")
+male_mouse <- subset(male_obj, subset = Species == "Mouse")
+
+# extract colors from the p1 
+default_colors_p1 <- c("#F8766D", "#DB72FB", "#D39200", "#619CFF", "#00B9E3", "#00C19F", "#00BA38", "#93AA00", "#FF61C3")
+
+default_colors_p2 <- c("#F8766D", "#DB72FB", "#D39200", "#619CFF", "#00B9E3", "#00C19F", "#00BA38", "#93AA00", "#FF61C3", "#E76BF3")
+
+unique(ggplot_build(p2)$data[[1]]$colour)
+
+p1 <- DimPlot(male_acomys, reduction = "umap.cca", split.by = "cca_clusters",
+              label = TRUE, label.size = 5, cols = default_colors_p1)
+
+p2 <- DimPlot(male_mouse, reduction = "umap.cca", split.by = "cca_clusters",
+              label = TRUE, label.size = 5, cols = default_colors_p2)
+
+
+p1 / p2
+```
+
+
+
+
+# cluster composition for subsetted objects 
+```{r}
+
+make_cluster_composition <- function(object) {
+  object@meta.data -> metadata
+  
+  cluster_composition <- metadata %>%
+    group_by(cca_clusters, Species) %>%
+    summarize(count = dplyr::n()) %>%
+    arrange(desc(count))
+  
+  metadata %>%
+    group_by(cca_clusters) %>%
+    summarize(count = dplyr::n()) %>%
+    arrange(desc(count)) %>% View()
+  
+  unique_clusters <- sort(unique(cluster_composition$cca_clusters))
+  cluster_composition$cca_clusters <- factor(
+    cluster_composition$cca_clusters, 
+    levels = unique_clusters
+  )
+  
+  
+  cluster_composition <- cluster_composition %>%
+    group_by(cca_clusters) %>%
+    mutate(proportion = count / sum(count))
+  
+  
+  cluster_composition[cluster_composition$cca_clusters == 9, ]
+  
+  # Visualize compositional data
+  p <- ggplot(cluster_composition, aes(as.factor(cca_clusters), count, fill = Species)) +
+    geom_bar(stat = "identity", position = "stack") +
+    geom_text(
+      aes(
+        label = scales::percent(proportion, 1),
+        vjust = ifelse(cca_clusters %in% 7:10 & Species == "Acomys", -0.5, 1.5)  # Adjust vjust for clusters 7–10
+      ),
+      position = position_stack(vjust = 0.5),
+      size = 3, color = "black"
+    ) +
+    labs(
+      title = "Cluster composition by Species within all samples",
+      x = "Cluster", 
+      y = "Cell count",
+      fill = "Species"
+    ) +
+    theme(legend.position = "bottom")
+  return(p)
+}
+
+```
+
+
+```{r}
+make_cluster_composition(male_obj)
+make_cluster_composition(female_obj)
+```
+# Make pseudotime and Trajectory analysis
+
+
+
+
+
+
+
+
+
+
+
+
+Correct orig.ident column in merged object
+
+```{r}
+# rename orig.idents for male 
+cell_ids <- colnames(merged_male)
+
+orig_idents <- sub("^(.*)_[^_]+$", "\\1", cell_ids)
+
+merged_male$orig.ident <- orig_idents
+
+table(merged_male$orig.ident)
+```
+
+```{r}
+# rename orig.idents for female
+cell_ids_fe <- colnames(merged_female)
+
+orig_idents_fe <- sub("^(.*)_[^_]+$", "\\1", cell_ids_fe)
+
+merged_female$orig.ident <- orig_idents_fe
+
+table(merged_female$orig.ident)
+
+# saving new objects
+saveRDS(merged_male, "merged_male.RDS")
+saveRDS(merged_female, "merged_female.RDS")
+
+```
+
+
+
+```{r}
+merged_male$orig.ident[merged_male$orig.ident == "Ac"]
+# plot for merged male samples
+n_cells <- merged_male$orig.ident %>% table %>% as.data.frame()
+colnames(n_cells) <- c("Sample", "Count")
+ggplot(n_cells, aes(Sample, Count)) + 
+  geom_col(fill = "#56B4E9") +
+  rotate_x_text(angle = 45) +
+  geom_text(aes(Sample, Count-222), label = n_cells$Count)
+```
+
+
+```{r}
+# plot for merged female samples
+n_cells <- merged_female$orig.ident %>% table %>% as.data.frame()
+colnames(n_cells) <- c("Sample", "Count")
+ggplot(n_cells, aes(Sample, Count)) + 
+  geom_col(fill = "#56B4E9") +
+  rotate_x_text(angle = 45) +
+  geom_text(aes(Sample, Count-222), label = n_cells$Count)
+
+```
+
+
+
+
+2. Let's integrate female and male samples separately
+
+
+
+Integration for Female 
+
+```{r}
+Idents(merged_female) <- merged_female$orig.ident
+
+
+#split object
+#merged_no_regression[["RNA"]] <- SeuratObject:::split.Assay5(merged_no_regression[["RNA"]], f = merged_no_regression$orig.ident)
+
+
+# run sctransform
+merged_female <- SCTransform(merged_female, vst.flavor = "v2")
+merged_female <- RunPCA(merged_female, npcs = 40, verbose = FALSE)
+
+
+
+
+Layers(merged_female)
+# CCA integration
+merged_female_integrated <- IntegrateLayers(
+  object = merged_female, method = CCAIntegration, assay = "SCT",
+  orig.reduction = "pca", new.reduction = "integrated.cca", normalization.method = "SCT",
+  verbose = TRUE
+)
+
+merged_female_integrated <- FindNeighbors(merged_female_integrated, reduction = "integrated.cca", dims = 1:30)
+merged_female_integrated <- FindClusters(merged_female_integrated, resolution = 0.3, cluster.name = "cca_clusters")
+
+merged_female_integrated <- RunUMAP(merged_female_integrated, reduction = "integrated.cca", dims = 1:30, reduction.name = "umap.cca")
+```
+
+
+
+```{r}
+DimPlot(merged_female_integrated, split.by = 'Species') 
+```
+
+
+```{r}
+DimPlot(merged_male_integrated, split.by = 'Species') 
+```
+
+
+```{r}
+# add species column to the integrated object
+merged_female_integrated$Species <- ifelse(str_detect(merged_female_integrated$orig.ident, "Ac_"), "Acomys", "Mouse")
+merged_male_integrated$Species <- ifelse(str_detect(merged_male_integrated$orig.ident, "Ac_"), "Acomys", "Mouse")
+
+```
+
+
+Integration for Male
+
+```{r}
+Idents(merged_male) <- merged_male$orig.ident
+
+
+#split object
+#merged_no_regression[["RNA"]] <- SeuratObject:::split.Assay5(merged_no_regression[["RNA"]], f = merged_no_regression$orig.ident)
+
+
+# run sctransform
+merged_male <- SCTransform(merged_male, vst.flavor = "v2")
+merged_male <- RunPCA(merged_male, npcs = 40, verbose = FALSE)
+
+
+
+
+Layers(merged_male)
+# CCA integration
+merged_male_integrated <- IntegrateLayers(
+  object = merged_male, method = CCAIntegration, assay = "SCT",
+  orig.reduction = "pca", new.reduction = "integrated.cca", normalization.method = "SCT",
+  verbose = TRUE
+)
+
+merged_male_integrated <- FindNeighbors(merged_male_integrated, reduction = "integrated.cca", dims = 1:30)
+merged_male_integrated <- FindClusters(merged_male_integrated, resolution = 0.3, cluster.name = "cca_clusters")
+
+merged_male_integrated <- RunUMAP(merged_male_integrated, reduction = "integrated.cca", dims = 1:30, reduction.name = "umap.cca")
+```
+
+
+Integrate two merged objects with other integration methods
+
+```{r, echo=FALSE, fig.height=5, fig.width=15}
+
+# CCA integration
+p1 <- DimPlot(
+  merged_male_integrated,
+  reduction = "umap.cca",
+  group.by = c("orig.ident", "Phase", "Species"),
+  combine = FALSE
+)
+patchwork::wrap_plots(p1)
+```
+
+```{r, echo=FALSE, fig.height=5, fig.width=15}
+
+# CCA integration
+p1 <- DimPlot(
+  merged_female_integrated,
+  reduction = "umap.cca",
+  group.by = c("orig.ident", "Phase", "Species"),
+  combine = FALSE
+)
+patchwork::wrap_plots(p1)
+```
+
+```{r, echo=FALSE, fig.height=5, fig.width=15}
+
+# CCA integration
+p1 <- DimPlot(
+  merged_female_integrated,
+  reduction = "umap.cca",
+  group.by = c("orig.ident", "Phase", "Species"),
+  combine = FALSE
+)
+patchwork::wrap_plots(p1)
+```
+
+
+```{r, echo=FALSE, fig.height=5, fig.width=12}
+
+# CCA integration
+p1 <- DimPlot(
+  merged_male_integrated,
+  reduction = "umap.cca",
+  group.by = c("orig.ident", "Phase"),
+  combine = FALSE
+)
+patchwork::wrap_plots(p1)
+```
+
+
+
+Female
+```{r, echo=FALSE, fig.height=5, fig.width=12}
+# Harmony
+merged_female_integrated <- IntegrateLayers(object = merged_female_integrated, method = HarmonyIntegration,
+                       orig.reduction = "pca", new.reduction = 'integrated.harmony',
+                       assay = "SCT", verbose = FALSE)
+
+merged_female_integrated <- FindNeighbors(merged_female_integrated, reduction = "integrated.harmony", dims = 1:30)
+merged_female_integrated <- FindClusters(merged_female_integrated, resolution = c(0.3), cluster.name = "harmony_clusters")
+ 
+merged_female_integrated <- RunUMAP(merged_female_integrated, reduction = "integrated.harmony", dims = 1:30, reduction.name = "umap.harmony")
+```
+
+```{r, echo=FALSE, fig.height=5, fig.width=15}
+p1 <- DimPlot(
+  merged_female_integrated,
+  reduction = "umap.harmony",
+  group.by = c("orig.ident", "Phase", "Species"),
+  combine = FALSE
+)
+patchwork::wrap_plots(p1)
+```
+
+
+```{r, echo=FALSE, fig.height=5, fig.width=12}
+
+# RPCA
+merged_female_integrated <- IntegrateLayers(object = merged_female_integrated, method = RPCAIntegration, orig.reduction = "pca", new.reduction = 'integrated.rpca', normalization.method = "SCT", verbose = TRUE)
+
+merged_female_integrated <- FindNeighbors(merged_female_integrated, reduction = "integrated.rpca", dims = 1:30)
+merged_female_integrated <- FindClusters(merged_female_integrated, resolution = c(0.3), cluster.name = "rpca_clusters")
+
+#
+merged_female_integrated <- RunUMAP(merged_female_integrated, reduction = "integrated.rpca", dims = 1:30, reduction.name = "umap.rpca")
+```
+
+
+```{r, echo=FALSE, fig.height=5, fig.width=15}
+p1 <- DimPlot(
+  merged_female_integrated,
+  reduction = "umap.rpca",
+  group.by = c("orig.ident", "Phase", "Species"),
+  combine = FALSE
+)
+patchwork::wrap_plots(p1)
+```
+
+
+```{r, echo=FALSE, fig.height=7, fig.width=12}
+
+# jointpca
+merged_female_integrated <- IntegrateLayers(object = merged_female_integrated, method = JointPCAIntegration,
+                                           orig.reduction = "pca", new.reduction = 'integrated.jointpca',
+                                           normalization.method = "SCT", verbose = TRUE)
+
+merged_female_integrated <- FindNeighbors(merged_female_integrated, reduction = "integrated.jointpca", dims = 1:30)
+merged_female_integrated <- FindClusters(merged_female_integrated, resolution = c(0.3), cluster.name = "jointpca_clusters")
+
+#
+merged_female_integrated <- RunUMAP(merged_female_integrated, reduction = "integrated.jointpca", dims = 1:30, reduction.name = "umap.jointpca")
+```
+
+
+```{r, echo=FALSE, fig.height=5, fig.width=15}
+p1 <- DimPlot(
+  merged_female_integrated,
+  reduction = "umap.jointpca",
+  group.by = c("orig.ident", "Phase", "Species"),
+  combine = FALSE
+)
+
+patchwork::wrap_plots(p1)
+```
+
+Male
+```{r, echo=FALSE, fig.height=5, fig.width=12}
+# Harmony
+merged_male_integrated <- IntegrateLayers(object = merged_male_integrated, method = HarmonyIntegration,
+                       orig.reduction = "pca", new.reduction = 'integrated.harmony',
+                       assay = "SCT", verbose = FALSE)
+
+merged_male_integrated <- FindNeighbors(merged_male_integrated, reduction = "integrated.harmony", dims = 1:30)
+merged_male_integrated <- FindClusters(merged_male_integrated, resolution = c(0.3), cluster.name = "harmony_clusters")
+ 
+merged_male_integrated <- RunUMAP(merged_male_integrated, reduction = "integrated.harmony", dims = 1:30, reduction.name = "umap.harmony")
+```
+
+
+```{r, echo=FALSE, fig.height=5, fig.width=15}
+p1 <- DimPlot(
+  merged_male_integrated,
+  reduction = "umap.harmony",
+  group.by = c("orig.ident", "Phase", "Species"),
+  combine = FALSE
+)
+patchwork::wrap_plots(p1)
+
+DimPlot(
+  merged_male_integrated,
+  reduction = "umap.harmony",
+  split.by = "Species",
+  combine = FALSE
+)
+```
+
+```{r, echo=FALSE, fig.height=5, fig.width=12}
+
+# RPCA
+merged_male_integrated <- IntegrateLayers(object = merged_male_integrated, method = RPCAIntegration, orig.reduction = "pca", new.reduction = 'integrated.rpca', normalization.method = "SCT", verbose = TRUE)
+
+merged_male_integrated <- FindNeighbors(merged_male_integrated, reduction = "integrated.rpca", dims = 1:30)
+merged_male_integrated <- FindClusters(merged_male_integrated, resolution = c(0.3), cluster.name = "rpca_clusters")
+
+#
+merged_male_integrated <- RunUMAP(merged_male_integrated, reduction = "integrated.rpca", dims = 1:30, reduction.name = "umap.rpca")
+```
+
+
+```{r, echo=FALSE, fig.height=5, fig.width=15}
+p1 <- DimPlot(
+  merged_male_integrated,
+  reduction = "umap.rpca",
+  group.by = c("orig.ident", "Phase", "Species"),
+  combine = FALSE
+)
+patchwork::wrap_plots(p1)
+```
+
+
+```{r, echo=FALSE, fig.height=7, fig.width=12}
+
+# jointpca
+merged_male_integrated <- IntegrateLayers(object = merged_male_integrated, method = JointPCAIntegration,
+                                           orig.reduction = "pca", new.reduction = 'integrated.jointpca',
+                                           normalization.method = "SCT", verbose = TRUE)
+
+merged_male_integrated <- FindNeighbors(merged_male_integrated, reduction = "integrated.jointpca", dims = 1:30)
+merged_male_integrated <- FindClusters(merged_male_integrated, resolution = c(0.3), cluster.name = "jointpca_clusters")
+
+#
+merged_male_integrated <- RunUMAP(merged_male_integrated, reduction = "integrated.jointpca", dims = 1:30, reduction.name = "umap.jointpca")
+```
+
+
+```{r, echo=FALSE, fig.height=5, fig.width=15}
+p1 <- DimPlot(
+  merged_male_integrated,
+  reduction = "umap.jointpca",
+  group.by = c("orig.ident", "Phase", "Species"),
+  combine = FALSE
+)
+
+patchwork::wrap_plots(p1)
+```
+
+
+Save results
+```{r}
+saveRDS(merged_male_integrated, "merged_male_integrated.RDS")
+saveRDS(merged_female_integrated, "merged_female_integrated.RDS")
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+###################
+
+Clusters annotation
+
+###################
+
+Female
+
+```{r, echo=FALSE, fig.height=7, fig.width=10}
+
+Idents(merged_female_integrated) <- merged_female_integrated$cca_clusters
+
+DimPlot(
+  merged_female_integrated,
+  reduction = "umap.cca",
+  split.by = "Species",
+  #group.by = c("orig.ident", "Phase", "Species"),
+  combine = FALSE, label.size = 5, label = T
+)
+
+table(merged_female_integrated$cca_clusters)
+```
+
+
+
+
+Have a look at cluster composition based on Species
+
+```{r, echo=FALSE}
+merged_female_integrated@meta.data -> metadata
+
+cluster_composition <- metadata %>%
+  group_by(cca_clusters, Species) %>%
+  summarize(count = dplyr::n()) %>%
+  arrange(desc(count))
+
+
+cluster_composition$cca_clusters <- factor(
+  cluster_composition$cca_clusters, 
+  levels = c(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10)  
+)
+
+
+cluster_composition <- cluster_composition %>%
+  group_by(cca_clusters) %>%
+  mutate(proportion = count / sum(count))
+
+
+# visualize compositional data
+ggplot(cluster_composition, aes(as.factor(cca_clusters), count, fill = Species))+
+  geom_bar(stat = "identity", position = "stack") +
+  geom_text(
+    aes(label = scales::percent(proportion, 1)),
+    position = position_stack(vjust = 0.5),
+    size = 3, color = "black"
+  )+
+  
+  labs(
+    title = "Cluster composition by Species within Female samples",
+    x = "Cluster", 
+    y = "Cell count",
+    fill = "Species")+
+  theme_minimal()
+
+#count_table <- table(merged_female_integrated@meta.data$cca_clusters, merged_female_integrated@meta.data$Species)
+#count_table
+
+```
+
+```{r, echo=FALSE}
+merged_male_integrated@meta.data -> male_metadata
+
+cluster_composition_male <- male_metadata %>%
+  group_by(cca_clusters, Species) %>%
+  summarize(count = dplyr::n()) %>%
+  arrange(desc(count))
+
+
+cluster_composition_male$cca_clusters <- factor(
+  cluster_composition_male$cca_clusters, 
+  levels = c(0, 1, 2, 3, 4, 5, 6, 7, 8, 9)  
+)
+
+
+cluster_composition_male <- cluster_composition_male %>%
+  group_by(cca_clusters) %>%
+  mutate(proportion = count / sum(count))
+
+
+# visualize compositional data
+ggplot(cluster_composition_male, aes(as.factor(cca_clusters), count, fill = Species))+
+  geom_bar(stat = "identity", position = "stack") +
+  geom_text(
+    aes(label = scales::percent(proportion, 1)),
+    position = position_stack(vjust = 0.5),
+    size = 3, color = "black"
+  )+
+  
+  labs(
+    title = "Cluster composition by Species within Male samples",
+    x = "Cluster", 
+    y = "Cell count",
+    fill = "Species")+
+  theme_minimal()
+
+```
+
+```{r, echo=FALSE, fig.height=4, fig.width=10}
+DimPlot(
+  merged_male_integrated,
+  reduction = "umap.cca",
+  #split.by = "Species",
+  group.by = c("cca_clusters", "Species"),
+  combine = T
+)
+
+table(merged_male_integrated$cca_clusters)
+```
+
+
+
+
+
+```{r}
+# Cyp17a1
+FeaturePlot(merged_female_integrated, 
+            features = c("Cyp17a1"), 
+            reduction = "umap.cca",
+            label = T, repel = T, 
+            split.by = "Species",
+            pt.size = 0.9, 
+            label.size = 5, 
+            order = T)
+
+FeaturePlot(merged_male_integrated, 
+            features = c("Cyp17a1"), 
+            reduction = "umap.cca",
+            label = T, repel = T, 
+            split.by = "Species",
+            pt.size = 0.9, 
+            label.size = 5, 
+            order = T)
+
+```
+
+
+```{r, echo=FALSE, fig.height=7, fig.width=12}
+# mesenchyme cells
+FeaturePlot(merged_female_integrated, 
+            features = c("Dcn", "Col1a1"), 
+            reduction = "umap.cca",
+            split.by = "Species",
+            label = T, repel = T, 
+            pt.size = 0.9, 
+            label.size = 5, 
+            order = T)
+
+# cluster 10 - mesenchyme cells
+
+# cortex
+FeaturePlot(merged_female_integrated, 
+            features = c("Cyp17a1", "Hsd3b1", "Nr5a1", "Star", "Cyp11b1"), 
+            reduction = "umap.cca",
+            split.by = "Species",
+            label = T, repel = T, 
+            pt.size = 0.9, 
+            label.size = 5, 
+            order = T)
+
+# progenitor cells
+FeaturePlot(merged_female_integrated, 
+            features = c("Top2a", "Mki67", "Dlk1", "Nr0b1", "Shh"), 
+            reduction = "umap.cca",
+            split.by = "Species",
+            label = T, repel = T, 
+            pt.size = 0.9, 
+            label.size = 5, 
+            order = TRUE)
+
+
+# capsule cells
+FeaturePlot(merged_female_integrated, 
+            features = c("Gli1", "Rspo3"), 
+            reduction = "umap.cca",
+            split.by = "Species",
+            label = T, repel = T, 
+            pt.size = 0.9, 
+            label.size = 5, 
+            order = TRUE)
+
+
+# zona glamerulosa
+FeaturePlot(merged_female_integrated, 
+            features = c("Agtr1b", "Cyp11b2"), 
+            reduction = "umap.cca",
+            split.by = "Species",
+            label = T, repel = T, 
+            pt.size = 0.9, 
+            label.size = 5, 
+            order = TRUE, keep.scale = "all", blend = T)
+
+
+
+
+```
+
+```{r, echo=FALSE, fig.height=7, fig.width=10}
+# zona reticularis
+FeaturePlot(merged_female_integrated, 
+            features = c("Cyp17a1", "Nr0b1"), 
+            reduction = "umap.cca",
+            split.by = "Species",
+            label = T, repel = T, 
+            pt.size = 0.9, 
+            label.size = 5, 
+            order = TRUE, keep.scale = "all", blend = F)
+
+```
+
+
+# Merge integrated objects (male and female) and then re-integrate them to get an embedding of acomys and mice samples
+
+```{r}
+# Merge the two objects and add prefixes for cell IDs
+merged_all <- merge(
+  x = merged_male_integrated, 
+  y = merged_female_integrated, 
+  add.cell.ids = c("male", "female"), 
+  project = "MergedAll"
+)
+```
+
+
+
+
+
+
+
+
+
+
+

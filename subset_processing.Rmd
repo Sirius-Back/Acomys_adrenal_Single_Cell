@@ -1,0 +1,1388 @@
+---
+title: "acomys_subset"
+author: "https://bioconductor.org/books/3.14/OSCA.advanced/droplet-processing.html"
+date: "2024-07-19"
+output: html_document
+---
+
+```{r}
+library(Seurat)
+
+if (!require("BiocManager", quietly = TRUE))
+    install.packages("BiocManager")
+
+BiocManager::install("scDblFinder")
+
+BiocManager::install("decontX")
+
+devtools::install_github("campbio/decontX")
+
+```
+
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+```{r,  echo=FALSE, fig.height=5, fig.width=10}
+Idents(merged_SCT_cc_regressed)
+merged_SCT_cc_regressed$cell_types <- Idents(merged_SCT_cc_regressed)
+merged_SCT_cc_regressed$cell_types %>% table
+
+DimPlot(merged_SCT_cc_regressed, reduction = 'umap.jointpca', split.by = "cell_types")
+p <- DimPlot(merged_SCT_cc_regressed, reduction = 'umap.jointpca', label = F, order = T,
+             cols = c("lightgray", "lightgray", "lightgray", "lightgray", "lightgray", 
+                      "#00BFC4", "lightgray", "lightgray", "lightgray", "lightgray"))
+p
+
+default_colors <- unique(ggplot2::ggplot_build(p)$data[[1]]$colour)  # Extract colors
+print(default_colors)  # View the default color palette
+```
+
+```{r}
+# Get cell names for the cell types of interest
+cells_to_plot <- WhichCells(merged_SCT_cc_regressed, expression = cell_types %in% c("иммунные клетки"))
+
+# Plot only those cells
+immune_cells <- DimPlot(merged_SCT_cc_regressed, reduction = 'umap.jointpca', cells = cells_to_plot, group.by = "cell_types", cols = "#00BFC4")
+
+# Interactively select cells by circling
+selected_cells <- CellSelector(plot = immune_cells)
+length(selected_cells) # we selected 157 cells 
+
+```
+
+
+
+
+
+
+
+```{r}
+# Extract UMAP coordinates and metadata
+data_all <- Seurat::FetchData(merged_SCT_cc_regressed, vars = c("umap.jointpca_1", "umap.jointpca_2", "cell_types"))
+
+ggplot(data_all, aes(x = umap.jointpca_1, y = umap.jointpca_2)) +
+  geom_point(color = "grey90", size = 0.5) +  # All cells in background (light grey)
+  geom_point(
+    data = data_all,
+    aes(color = cell_types, alpha = ifelse(cell_types == cur_cell_type, 1, 0)),
+    size = 0.5
+  ) +
+  facet_wrap(~cell_types) +
+  scale_alpha_identity() +  # Use alpha values directly (no legend)
+  theme_minimal() +
+  guides(color = "none")
+```
+
+
+```{r,  echo=FALSE, fig.height=7, fig.width=12}
+FeaturePlot(merged_SCT_cc_regressed, features = c("Top2a", "Mki67", "Dcn", "Col1a1"), order = T, reduction = "umap.jointpca")
+```
+
+
+
+
+
+
+```{r}
+names_to_keep <- c("кора", "прогениторные клетки?", "кора (клубочковая зона)", "соединительная ткань")
+Idents(merged_SCT_cc_regressed)
+# subset seurat object
+subset_obj <- subset(merged_SCT_cc_regressed, idents = names_to_keep)
+
+subset_obj$orig.ident %>% unique()
+
+sample_list <- SplitObject(subset_obj, split.by = "orig.ident")
+# get raw coubt matrix
+raw_counts <- GetAssayData(subset_obj, layer = "counts")
+
+names(raw_counts)
+# process raw count matrix as in previous steps 
+so <- Seurat::CreateSeuratObject(counts = raw_counts, min.cells = 3)
+
+# filter out doublets
+sce <- as.SingleCellExperiment(so)
+sce <- scDblFinder(sce)
+so$scDblFinder_class <- sce$scDblFinder.class
+so <- subset(so, subset = scDblFinder_class == "singlet")
+
+# Normalize data using SCTransform version 2
+so <- SCTransform(so,
+                  vst.flavor = "v2",
+                  return.only.var.genes = F,
+                  verbose = FALSE)
+
+# Score cell cycle for each cell
+genes <- rownames(raw_counts)
+g2m <- cell_cycle_genes[cell_cycle_genes$phase == "G2/M", ]$gene
+S <- cell_cycle_genes[cell_cycle_genes$phase == "S", ]$gene
+s.genes <- S[S %in% rownames(so)]
+g2m.genes <- g2m[g2m %in% rownames(so)]
+so <- CellCycleScoring(so, s.features = s.genes, g2m.features = g2m.genes, set.ident = TRUE)
+so$CC.Difference <- so$S.Score - so$G2M.Score
+
+
+# Normalize data using SCTransform version 2
+so <- SCTransform(so,
+                  vst.flavor = "v2",
+                  return.only.var.genes = F,
+                  verbose = FALSE, vars.to.regress = "CC.Difference")
+
+
+so <- Seurat::RunPCA(so, npcs = 50, verbose = TRUE)
+so <- Seurat::RunUMAP(object = so, dims = 1:10, verbose = TRUE)
+
+DefaultAssay(so) <- "SCT"
+
+save.RDS(so, "subset_170724.RDS")
+```
+
+```{r}
+
+
+
+```
+
+```{r}
+FeaturePlot()
+```
+
+
+
+
+
+```{r}
+########################## Workflow 2
+# from seurat developer on github: https://github.com/satijalab/seurat/issues/7542
+so[["RNA"]] <- split(so[["RNA"]], f = so$orig.ident)
+```
+
+```{r}
+# run sctransform
+so <- SCTransform(so, vst.flavor = "v2", vars.to.regress = c("CC.Difference"))
+so <- RunPCA(so, npcs = 30, verbose = FALSE)
+```
+
+
+```{r}
+# Harmony
+so <- IntegrateLayers(object = so, method = HarmonyIntegration,
+                       orig.reduction = "pca", new.reduction = 'integrated.harmony',
+                       assay = "SCT", verbose = FALSE)
+```
+
+```{r,  echo=FALSE, fig.height=5, fig.width=12}
+# so <- FindNeighbors(so, reduction = "integrated.harmony", dims = 1:30)
+# so <- FindClusters(so, resolution = c(0.3), cluster.name = "harmony_clusters")
+# 
+# #
+# so <- RunUMAP(so, reduction = "integrated.harmony", dims = 1:30, reduction.name = "umap.harmony")
+
+p1 <- DimPlot(
+  so,
+  reduction = "umap.harmony",
+  group.by = c("orig.ident", "Phase"),
+  combine = FALSE
+)
+patchwork::wrap_plots(p1)
+
+so$orig.ident %>% unique()
+
+n_cells <- so$orig.ident %>% table %>% as.data.frame()
+colnames(n_cells) <- c("Sample", "Count")
+ggplot(n_cells, aes(Sample, Count)) + 
+  geom_col(fill = "#56B4E9") +
+  rotate_x_text(angle = 45) +
+  geom_text(aes(Sample, Count-222), label = n_cells$Count)
+```
+
+
+```{r,  echo=FALSE, fig.height=5, fig.width=12}
+# options(future.globals.maxSize = 8000 * 1024^2)
+# # RPCA
+# so <- IntegrateLayers(object = so, method = RPCAIntegration, orig.reduction = "pca", new.reduction = 'integrated.rpca', normalization.method = "SCT", verbose = TRUE)
+# 
+# so <- FindNeighbors(so, reduction = "integrated.rpca", dims = 1:30)
+# so <- FindClusters(so, resolution = c(0.3), cluster.name = "rpca_clusters")
+# 
+# #
+# so <- RunUMAP(so, reduction = "integrated.rpca", dims = 1:30, reduction.name = "umap.rpca")
+
+p1 <- DimPlot(
+  so,
+  reduction = "umap.rpca",
+  group.by = c("orig.ident", "Phase"),
+  combine = FALSE
+)
+patchwork::wrap_plots(p1)
+```
+
+
+
+```{r, echo=FALSE, fig.height=7, fig.width=12}
+# # jointpca
+# so <- IntegrateLayers(object = so, method = JointPCAIntegration,
+#                                            orig.reduction = "pca", new.reduction = 'integrated.jointpca',
+#                                            normalization.method = "SCT", verbose = TRUE)
+# 
+# so <- FindNeighbors(so, reduction = "integrated.jointpca", dims = 1:30)
+# so <- FindClusters(so, resolution = c(0.3), cluster.name = "jointpca_clusters")
+# 
+# #
+# so <- RunUMAP(so, reduction = "integrated.jointpca", dims = 1:30, reduction.name = "umap.jointpca")
+# 
+# p1 <- DimPlot(
+#   so,
+#   reduction = "umap.jointpca",
+#   group.by = c("orig.ident", "Phase"),
+#   combine = FALSE
+# )
+
+FeaturePlot(so, 
+            features = c("Dlk1", "Cyp11b2", "Shh", "Agtr1b"), 
+            reduction = "umap.jointpca",
+            label = T, repel = T, 
+            pt.size = 0.9, 
+            label.size = 5, 
+            order = T)
+
+#patchwork::wrap_plots(p1)
+```
+
+
+```{r}
+###### Clustering analysis
+so[["RNA"]] <- JoinLayers(so[["RNA"]])
+
+# prepare for Finding markers
+sso <- PrepSCTFindMarkers(so, assay = "SCT")
+```
+
+```{r}
+Idents(so) <- so$harmony_clusters
+# find markers for every cluster compared to all remaining cells, report only the positive
+# ones
+so.markers <- FindAllMarkers(so, only.pos = TRUE)
+
+library(openxlsx)
+
+# Perform the filtering
+filtered_markers_so <- so.markers %>%
+  group_by(cluster) %>%
+  dplyr::filter(avg_log2FC > 1) %>%
+  top_n(n = 100, wt = cluster)
+
+# Save to an Excel file
+#write.xlsx(filtered_markers_so, file = "SCT_markers_0.3_040724.xlsx")
+```
+
+
+```{r}
+#saveRDS(so, "subset_integration_190724.RData")
+so <- readRDS("subset_170724.RDS")
+so
+```
+
+```{r}
+#install.packages("VennDiagram")                       # Install VennDiagram package
+library("VennDiagram")  
+
+length(rownames(subset_obj)) # 16463 genes in Acomys samples
+length(rownames(pericort) %>% unique()) # 38710 genes in Mice smples
+
+grid.newpage()
+draw.pairwise.venn(
+  area1 = length(rownames(subset_obj)),
+  area2 = length(rownames(pericort) %>% unique()),
+  cross.area = length(intersect(rownames(subset_obj), rownames(pericort))),
+  category = c("Acomys", "Mouse"),
+  fill = c("skyblue", "orange"),
+  lty = "blank",
+  cex = 2, 
+  cat.cex = 2,
+  cat.pos = c(-20, 20),
+  cat.dist = 0.03, 
+  cat.col = c("skyblue", "orange")
+)
+
+```
+
+
+
+###################### 
+
+Processing without regression CC
+
+######################
+```{r}
+# subset seurat object
+subset_obj <- subset(merged_SCT_cc_regressed, idents = names_to_keep)
+
+subset_obj$orig.ident %>% unique()
+
+sample_list <- SplitObject(subset_obj, split.by = "orig.ident")
+# get raw coubt matrix
+raw_counts <- GetAssayData(sample_list, layer = "counts")
+```
+
+
+Process subsetted cells without CC regression
+```{r, echo=FALSE, fig.height=5, fig.width=12}
+suppressPackageStartupMessages(library(scDblFinder))
+
+processed_no_regression <- lapply(sample_list, function(sample) {
+  
+  # Extract raw count matrix
+  raw_counts <- GetAssayData(sample, slot = "counts")
+  
+  # Create new Seurat object with raw matrix
+  so_not_regressed <- CreateSeuratObject(counts = raw_counts)
+  
+  # Perform standard QC
+  so_not_regressed[["percent.mt"]] <- PercentageFeatureSet(so_not_regressed, pattern = "^MT-")
+  so_not_regressed <- subset(so_not_regressed, subset = nFeature_RNA > 200 & percent.mt < 5)
+  
+  # Convert to SingleCellExperiment for DecontX and scDblFinder
+  sce <- as.SingleCellExperiment(so_not_regressed)
+  
+  # Run DecontX for contamination correction
+  sce <- decontX(sce)
+  
+  # Update Seurat object with decontaminated counts
+  decontaminated_counts <- assays(sce)$decontXcounts
+  so_not_regressed <- SetAssayData(so_not_regressed, assay = "RNA", slot = "counts", new.data = decontaminated_counts)
+  
+  # Run scDblFinder for doublet detection
+  sce <- scDblFinder(sce)
+  
+  # Filter out detected doublets
+  so_not_regressed$scDblFinder_class <- sce$scDblFinder.class
+  so_not_regressed <- subset(so_not_regressed, subset = scDblFinder_class == "singlet")
+  
+  # Normalize data using SCTransform version 2
+  so_not_regressed <- SCTransform(so_not_regressed, vst.flavor = "v2", return.only.var.genes = F, verbose = FALSE)
+
+  # Score cell cycle for each cell
+  genes <- rownames(raw_counts)
+  g2m <- cell_cycle_genes[cell_cycle_genes$phase == "G2/M", ]$gene
+  S <- cell_cycle_genes[cell_cycle_genes$phase == "S", ]$gene
+  s.genes <- S[S %in% rownames(so_not_regressed)]
+  g2m.genes <- g2m[g2m %in% rownames(so_not_regressed)]
+  so_not_regressed <- CellCycleScoring(so_not_regressed, s.features = s.genes, g2m.features = g2m.genes, set.ident = TRUE)
+
+  # Run PCA
+  so_not_regressed <- Seurat::RunPCA(so_not_regressed, npcs = 50, verbose = TRUE)
+  
+  # Run UMAP
+  so_not_regressed <- Seurat::RunUMAP(object = so_not_regressed, dims = 1:10, verbose = TRUE)
+  
+  # Set default assay to SCT
+  DefaultAssay(so_not_regressed) <- "SCT"
+  
+  return(so_not_regressed)
+})
+```
+
+
+
+```{r}
+
+merged_no_regression <- merge(processed_no_regression[[1]], list(processed_no_regression[[2]], 
+                                                        processed_no_regression[[3]], 
+                                                        processed_no_regression[[4]], 
+                                                        processed_no_regression[[5]], 
+                                                        processed_no_regression[[6]], 
+                                                        processed_no_regression[[7]], 
+                                                        processed_no_regression[[8]], 
+                                                        processed_no_regression[[9]], 
+                                                        processed_no_regression[[10]]))
+
+pattern <- "_[A-Z]"
+# 
+colnames(merged_no_regression)  
+str_split_fixed(colnames(merged_no_regression), pattern, 2)[, 1] 
+
+merged_no_regression$orig.ident <- str_split_fixed(colnames(merged_no_regression), pattern, 2)[, 1]
+
+n_cells <- merged_no_regression$orig.ident %>% table %>% as.data.frame()
+colnames(n_cells) <- c("Sample", "Count")
+ggplot(n_cells, aes(Sample, Count)) + 
+  geom_col(fill = "#56B4E9") +
+  rotate_x_text(angle = 45) +
+  geom_text(aes(Sample, Count-222), label = n_cells$Count)
+
+```
+
+```{r}
+# 
+str_split_fixed(colnames(merged_no_regression), pattern, 2)[1]
+
+###### Add some sex 
+merged_no_regression$Sex <- ifelse(merged_no_regression$orig.ident %in% c('Ac_adreno_female_1', 'Ac_adreno_female_10',
+                                                              'Ac_adreno_female_2', 'Ac_adreno_female_3', 'Ac_adreno_female_9'), 
+                             "female", "male")
+
+
+merged_no_regression$Sex %>% unique()
+
+merged_no_regression$orig.ident %>% unique()
+Idents(merged_no_regression) <- merged_no_regression$orig.ident
+
+
+#split object
+#merged_no_regression[["RNA"]] <- SeuratObject:::split.Assay5(merged_no_regression[["RNA"]], f = merged_no_regression$orig.ident)
+
+
+# run sctransform
+merged_no_regression <- SCTransform(merged_no_regression, vst.flavor = "v2")
+merged_no_regression <- RunPCA(merged_no_regression, npcs = 30, verbose = FALSE)
+
+
+
+
+Layers(merged_no_regression)
+# CCA integration
+merged_no_regression <- IntegrateLayers(
+  object = merged_no_regression, method = CCAIntegration, assay = "SCT",
+  orig.reduction = "pca", new.reduction = "integrated.cca", normalization.method = "SCT",
+  verbose = TRUE
+)
+
+merged_no_regression <- FindNeighbors(merged_no_regression, reduction = "integrated.cca", dims = 1:30)
+merged_no_regression <- FindClusters(merged_no_regression, resolution = 0.3, cluster.name = "cca_clusters")
+
+merged_no_regression <- RunUMAP(merged_no_regression, reduction = "integrated.cca", dims = 1:30, reduction.name = "umap.cca")
+
+```
+
+```{r, echo=FALSE, fig.height=5, fig.width=12}
+
+# CCA integration
+p1 <- DimPlot(
+  merged_no_regression,
+  reduction = "umap.cca",
+  group.by = c("orig.ident", "Phase"),
+  combine = FALSE
+)
+patchwork::wrap_plots(p1)
+```
+
+
+
+```{r, echo=FALSE, fig.height=5, fig.width=12}
+# Harmony
+merged_no_regression <- IntegrateLayers(object = merged_no_regression, method = HarmonyIntegration,
+                       orig.reduction = "pca", new.reduction = 'integrated.harmony',
+                       assay = "SCT", verbose = FALSE)
+
+merged_no_regression <- FindNeighbors(merged_no_regression, reduction = "integrated.harmony", dims = 1:30)
+merged_no_regression <- FindClusters(merged_no_regression, resolution = c(0.3), cluster.name = "harmony_clusters")
+ 
+merged_no_regression <- RunUMAP(merged_no_regression, reduction = "integrated.harmony", dims = 1:30, reduction.name = "umap.harmony")
+
+p1 <- DimPlot(
+  merged_no_regression,
+  reduction = "umap.harmony",
+  group.by = c("orig.ident", "Sex"),
+  combine = FALSE
+)
+patchwork::wrap_plots(p1)
+```
+
+```{r, echo=FALSE, fig.height=5, fig.width=12}
+
+# RPCA
+merged_no_regression <- IntegrateLayers(object = merged_no_regression, method = RPCAIntegration, orig.reduction = "pca", new.reduction = 'integrated.rpca', normalization.method = "SCT", verbose = TRUE)
+
+merged_no_regression <- FindNeighbors(merged_no_regression, reduction = "integrated.rpca", dims = 1:30)
+merged_no_regression <- FindClusters(merged_no_regression, resolution = c(0.3), cluster.name = "rpca_clusters")
+
+#
+merged_no_regression <- RunUMAP(merged_no_regression, reduction = "integrated.rpca", dims = 1:30, reduction.name = "umap.rpca")
+
+p1 <- DimPlot(
+  merged_no_regression,
+  reduction = "umap.rpca",
+  group.by = c("orig.ident", "Phase"),
+  combine = FALSE
+)
+patchwork::wrap_plots(p1)
+```
+
+```{r, echo=FALSE, fig.height=7, fig.width=12}
+
+# jointpca
+merged_no_regression <- IntegrateLayers(object = merged_no_regression, method = JointPCAIntegration,
+                                           orig.reduction = "pca", new.reduction = 'integrated.jointpca',
+                                           normalization.method = "SCT", verbose = TRUE)
+
+merged_no_regression <- FindNeighbors(merged_no_regression, reduction = "integrated.jointpca", dims = 1:30)
+merged_no_regression <- FindClusters(merged_no_regression, resolution = c(0.3), cluster.name = "jointpca_clusters")
+
+#
+merged_no_regression <- RunUMAP(merged_no_regression, reduction = "integrated.jointpca", dims = 1:30, reduction.name = "umap.jointpca")
+
+p1 <- DimPlot(
+  merged_no_regression,
+  reduction = "umap.jointpca",
+  group.by = c("orig.ident", "Phase"),
+  combine = FALSE
+)
+
+patchwork::wrap_plots(p1)
+
+
+#patchwork::wrap_plots(p1)
+save.image(merged_no_regression, "subset_integration_w/o_cc_regression_190724.RData")
+merged_no_regression
+```
+
+
+```{r, echo=FALSE, fig.height=7, fig.width=12}
+
+FeaturePlot(merged_no_regression, 
+            features = c("Top2a", "Mki67", "Sqle", "Hmgcr"), 
+            reduction = "umap.jointpca",
+            label = T, repel = T, 
+            pt.size = 0.9, 
+            label.size = 5, 
+            order = TRUE)
+
+```
+
+
+```{r, echo=FALSE, fig.height=7, fig.width=12}
+# ## pericort data 
+ 
+#pericort <- readRDS("Mouse_pericort_common_seur_final.rds")
+orig_idents <- unique(pericort$orig.ident)
+pericort
+ 
+# check whether you are getting the genes you want
+grep("^mt-", rownames(pericort@assays$RNA@data), value = T)
+grep("Rps|Rpl|Mrpl|Mrps", rownames(pericort@assays$RNA@data), value = T)
+ 
+ 
+# add the percentage of these mitochondrial or ribosomal genes to the meta.data
+pericort[["percent.mito"]] <- PercentageFeatureSet(object = pericort, pattern = "^mt-")
+pericort[["percent.ribo"]] <- PercentageFeatureSet(object = pericort, pattern = "Rps|Rpl|Mrpl|Mrps")
+ 
+plot1 <- FeatureScatter(object = pericort, feature1 = "nCount_RNA", feature2 = "percent.mito")+
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+plot2 <- FeatureScatter(object = pericort, feature1 = "nCount_RNA", feature2 = "nFeature_RNA")+
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+plot3 <- FeatureScatter(object = pericort, feature1 = "nCount_RNA", feature2 = "percent.ribo")+
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+ 
+plot1 + plot2 + plot3
+
+```
+
+
+```{r}
+save.image("acomys_integration_240724.Rdata")
+
+```
+
+
+```{r}
+pericort$orig.ident %>% unique()
+sample_list_pericort <- SplitObject(pericort, split.by = "orig.ident")
+acomys_mice_list = c(sample_list_pericort, sample_list)
+length(acomys_mice_list)
+
+```
+
+
+```{r, echo=FALSE, fig.height=5, fig.width=12}
+# suppressPackageStartupMessages(library(scDblFinder))
+#remove.packages("decontX")
+#devtools::install_github("campbio/decontX")
+#BiocManager::install("glmGamPoi")
+library(glmGamPoi)
+library(decontX)
+
+acomys <- lapply(sample_list, function(sample) {
+  
+  # Extract raw count matrix
+  raw_counts <- GetAssayData(sample, layer = "counts")
+  
+  # Create new Seurat object with raw matrix
+  so_not_regressed <- CreateSeuratObject(counts = raw_counts)
+  
+  # Perform standard QC
+  so_not_regressed[["percent.mito"]] <- PercentageFeatureSet(so_not_regressed, pattern = "^MT-")
+  so_not_regressed <- subset(so_not_regressed, subset = nFeature_RNA > 200 & percent.mito < 15)
+  
+  # Convert to SingleCellExperiment for DecontX and scDblFinder
+  sce <- as.SingleCellExperiment(so_not_regressed)
+  
+  # Run DecontX for contamination correction
+  sce <- decontX(sce)
+  
+  # Update Seurat object with decontaminated counts
+  decontaminated_counts <- assays(sce)$decontXcounts
+  so_not_regressed <- SetAssayData(so_not_regressed, assay = "RNA", slot = "counts", new.data = decontaminated_counts)
+  
+  # Run scDblFinder for doublet detection
+  sce <- scDblFinder(sce)
+  
+  # Filter out detected doublets
+  so_not_regressed$scDblFinder_class <- sce$scDblFinder.class
+  so_not_regressed <- subset(so_not_regressed, subset = scDblFinder_class == "singlet")
+  
+  # Normalize data using SCTransform version 2
+  so_not_regressed <- SCTransform(so_not_regressed, vst.flavor = "v2", return.only.var.genes = F, verbose = FALSE)
+
+  # Score cell cycle for each cell
+  genes <- rownames(raw_counts)
+  g2m <- cell_cycle_genes[cell_cycle_genes$phase == "G2/M", ]$gene
+  S <- cell_cycle_genes[cell_cycle_genes$phase == "S", ]$gene
+  s.genes <- S[S %in% rownames(so_not_regressed)]
+  g2m.genes <- g2m[g2m %in% rownames(so_not_regressed)]
+  so_not_regressed <- CellCycleScoring(so_not_regressed, s.features = s.genes, g2m.features = g2m.genes, set.ident = TRUE)
+
+  # Run PCA
+  so_not_regressed <- Seurat::RunPCA(so_not_regressed, npcs = 50, verbose = TRUE)
+  
+  # Run UMAP
+  so_not_regressed <- Seurat::RunUMAP(object = so_not_regressed, dims = 1:10, verbose = TRUE)
+  
+  # Set default assay to SCT
+  DefaultAssay(so_not_regressed) <- "SCT"
+  
+  return(so_not_regressed)
+})
+
+
+
+# pipeline for mouse pericort data
+mice <- lapply(sample_list_pericort, function(sample) {
+  
+  # Extract raw count matrix
+  raw_counts <- GetAssayData(sample, layer = "counts")
+  
+  # Create new Seurat object with raw matrix
+  so_not_regressed <- CreateSeuratObject(counts = raw_counts)
+  
+  # Perform standard QC
+  so_not_regressed[["percent.mito"]] <- PercentageFeatureSet(so_not_regressed, pattern = "^MT-")
+  so_not_regressed <- subset(so_not_regressed, subset = nFeature_RNA > 200 & percent.mito < 15)
+  
+  # Convert to SingleCellExperiment for DecontX and scDblFinder
+  sce <- as.SingleCellExperiment(so_not_regressed)
+  
+  # Run DecontX for contamination correction
+  #sce <- decontX(sce)
+  
+  # Update Seurat object with decontaminated counts
+  #decontaminated_counts <- assays(sce)$decontXcounts
+  #so_not_regressed <- SetAssayData(so_not_regressed, assay = "RNA", slot = "counts", new.data = decontaminated_counts)
+  
+  # Run scDblFinder for doublet detection
+  #sce <- scDblFinder(sce)
+  
+  # Filter out detected doublets
+  #so_not_regressed$scDblFinder_class <- sce$scDblFinder.class
+  #so_not_regressed <- subset(so_not_regressed, subset = scDblFinder_class == "singlet")
+  
+  # Normalize data using SCTransform version 2
+  so_not_regressed <- SCTransform(so_not_regressed, vst.flavor = "v2", return.only.var.genes = F, verbose = FALSE)
+
+  # Score cell cycle for each cell
+  genes <- rownames(raw_counts)
+  g2m <- cell_cycle_genes[cell_cycle_genes$phase == "G2/M", ]$gene
+  S <- cell_cycle_genes[cell_cycle_genes$phase == "S", ]$gene
+  s.genes <- S[S %in% rownames(so_not_regressed)]
+  g2m.genes <- g2m[g2m %in% rownames(so_not_regressed)]
+  so_not_regressed <- CellCycleScoring(so_not_regressed, s.features = s.genes, g2m.features = g2m.genes, set.ident = TRUE)
+
+  # Run PCA
+  so_not_regressed <- Seurat::RunPCA(so_not_regressed, npcs = 50, verbose = TRUE)
+  
+  # Run UMAP
+  so_not_regressed <- Seurat::RunUMAP(object = so_not_regressed, dims = 1:10, verbose = TRUE)
+  
+  # Set default assay to SCT
+  DefaultAssay(so_not_regressed) <- "SCT"
+  
+  return(so_not_regressed)
+})
+
+rm(so_not_regressed)
+```
+
+
+```{r}
+# merginf acomys and mice lists
+acomys
+mice
+
+merge_mice <- merge(mice[[1]], y = c(mice[-1], acomys))
+
+```
+
+
+```{r, echo=FALSE, fig.height=5, fig.width=12}
+# pattern <- "_[A-Z]"
+# # 
+# colnames(merge_mice)  
+# str_split_fixed(colnames(merge_mice), pattern, 2)[, 1] 
+# 
+# merge_mice$orig.ident <- str_split_fixed(colnames(merge_mice), pattern, 2)[, 1]
+
+# add orig.ident column with sample names
+
+
+
+n_cells <- merge_mice$orig.ident %>% table %>% as.data.frame()
+colnames(n_cells) <- c("Sample", "Count")
+ggplot(n_cells, aes(Sample, Count)) + 
+  geom_col(fill = "#56B4E9") +
+  rotate_x_text(angle = 45) +
+  geom_text(aes(Sample, Count-222), label = n_cells$Count)
+
+```
+
+
+```{r}
+Idents(merge_mice) <- merge_mice$orig.ident
+
+
+#split object
+#merged_no_regression[["RNA"]] <- SeuratObject:::split.Assay5(merged_no_regression[["RNA"]], f = merged_no_regression$orig.ident)
+
+
+# run sctransform
+merge_mice <- SCTransform(merge_mice, vst.flavor = "v2")
+merge_mice <- RunPCA(merge_mice, npcs = 40, verbose = FALSE)
+
+
+
+
+Layers(merge_mice)
+# CCA integration
+merge_mice <- IntegrateLayers(
+  object = merge_mice, method = CCAIntegration, assay = "SCT",
+  orig.reduction = "pca", new.reduction = "integrated.cca", normalization.method = "SCT",
+  verbose = TRUE
+)
+
+merge_mice <- FindNeighbors(merge_mice, reduction = "integrated.cca", dims = 1:30)
+merge_mice <- FindClusters(merge_mice, resolution = 0.3, cluster.name = "cca_clusters")
+
+merge_mice <- RunUMAP(merge_mice, reduction = "integrated.cca", dims = 1:30, reduction.name = "umap.cca")
+```
+
+```{r, echo=FALSE, fig.height=5, fig.width=12}
+
+# CCA integration
+p1 <- DimPlot(
+  merge_mice,
+  reduction = "umap.cca",
+  group.by = c("orig.ident", "Phase"),
+  combine = FALSE
+)
+patchwork::wrap_plots(p1)
+```
+
+
+
+
+```{r, echo=FALSE, fig.height=5, fig.width=12}
+# Harmony
+merge_mice <- IntegrateLayers(object = merge_mice, method = HarmonyIntegration,
+                       orig.reduction = "pca", new.reduction = 'integrated.harmony',
+                       assay = "SCT", verbose = FALSE)
+
+merge_mice <- FindNeighbors(merge_mice, reduction = "integrated.harmony", dims = 1:30)
+merge_mice <- FindClusters(merge_mice, resolution = c(0.3), cluster.name = "harmony_clusters")
+ 
+merge_mice <- RunUMAP(merge_mice, reduction = "integrated.harmony", dims = 1:30, reduction.name = "umap.harmony")
+
+p1 <- DimPlot(
+  merge_mice,
+  reduction = "umap.harmony",
+  group.by = c("orig.ident", "Phase"),
+  combine = FALSE
+)
+patchwork::wrap_plots(p1)
+```
+
+```{r, echo=FALSE, fig.height=5, fig.width=12}
+
+# RPCA
+merge_mice <- IntegrateLayers(object = merge_mice, method = RPCAIntegration, orig.reduction = "pca", new.reduction = 'integrated.rpca', normalization.method = "SCT", verbose = TRUE)
+
+merge_mice <- FindNeighbors(merge_mice, reduction = "integrated.rpca", dims = 1:30)
+merge_mice <- FindClusters(merge_mice, resolution = c(0.3), cluster.name = "rpca_clusters")
+
+#
+merge_mice <- RunUMAP(merge_mice, reduction = "integrated.rpca", dims = 1:30, reduction.name = "umap.rpca")
+
+p1 <- DimPlot(
+  merge_mice,
+  reduction = "umap.rpca",
+  group.by = c("orig.ident", "Phase"),
+  combine = FALSE
+)
+patchwork::wrap_plots(p1)
+```
+
+
+
+```{r, echo=FALSE, fig.height=7, fig.width=14}
+
+# jointpca
+merge_mice <- IntegrateLayers(object = merge_mice, method = JointPCAIntegration,
+                                           orig.reduction = "pca", new.reduction = 'integrated.jointpca',
+                                           normalization.method = "SCT", verbose = TRUE, dims = 1:40)
+
+merge_mice <- FindNeighbors(merge_mice, reduction = "integrated.jointpca", dims = 1:40)
+merge_mice <- FindClusters(merge_mice, resolution = c(0.5), cluster.name = "jointpca_clusters")
+
+#
+merge_mice <- RunUMAP(merge_mice, reduction = "integrated.jointpca", dims = 1:40, reduction.name = "umap.jointpca")
+
+p1 <- DimPlot(
+  merge_mice,
+  reduction = "umap.jointpca",
+  combine = FALSE
+)
+
+patchwork::wrap_plots(p1)
+
+#rm(sample_list_pericort, sce, so, so_not_regressed, sub_obj, subset_obj, processed_no_regressionpericort, merged_no_regression)
+#patchwork::wrap_plots(p1)
+saveRDS(merge_mice, "merge_mice_280724.RDS")
+#save.image("merge_mice_280724.RData")
+```
+
+add mouse clusters annotation to integrated object
+```{r}
+# 
+# Extract metadata from object A
+metadata_A <- pericort@meta.data
+seurat_clusters_A <- metadata_A$seurat_clusters
+cells_A <- colnames(pericort)
+
+# Check the head of cell names from A and integrated object
+head(cells_A)
+head(colnames(merge_mice))
+
+# Standardize cell names if necessary (example: adding prefix/suffix)
+if (grepl("^sample1_", colnames(merge_mice)[1])) {
+    cells_A <- paste0("sample1_", cells_A)
+}
+
+# Find common cells between the two objects
+common_cells <- intersect(cells_A, colnames(merge_mice))
+
+# Ensure the seurat_clusters are correctly subsetted for the common cells
+seurat_clusters_common <- seurat_clusters_A[match(common_cells, cells_A)]
+
+# Check that seurat_clusters_common has no NAs
+if (sum(is.na(seurat_clusters_common)) > 0) {
+    stop("Mismatch in cell names; some clusters are missing.")
+}
+
+# Create a new column for seurat_clusters if it doesn't exist
+if (!"seurat_clusters" %in% colnames(merge_mice@meta.data)) {
+    merge_mice@meta.data$mice_clusters <- NA
+}
+
+# Assign the cluster values to the correct cells
+merge_mice@meta.data[common_cells, "mice_clusters"] <- seurat_clusters_common
+
+# Verify the metadata
+tail(merge_mice@meta.data)
+
+#replace NAs in mice_clusters column
+library(na.tools)
+merge_mice$mice_clusters <- na.replace(merge_mice$mice_clusters, "Unknown")
+
+merge_mice$mice_clusters %>% unique()
+```
+
+
+```{r, echo=FALSE, fig.height=7, fig.width=12}
+Idents(merge_mice) <- merge_mice$jointpca_clusters
+DimPlot(
+  merge_mice,
+  reduction = "umap.jointpca",
+  split.by = "Species",
+  label = T, label.size = 6
+)
+```
+
+
+```{r, echo=FALSE, fig.height=7, fig.width=12}
+Idents(merge_mice) <- merge_mice$mice_clusters
+
+DimPlot(
+  merge_mice,
+  reduction = "umap.jointpca",
+  split.by = "Species",
+  label = T, label.size = 6
+)
+```
+
+
+```{r}
+merge_mice <- merge_mice_280724
+```
+
+
+```{r, echo=FALSE, fig.height=7, fig.width=11}
+# mesenchyme cells
+FeaturePlot(merge_mice, 
+            features = c("Dcn", "Col1a1"), 
+            reduction = "umap.jointpca",
+            split.by = "Species",
+            label = T, repel = T, 
+            pt.size = 0.9, 
+            label.size = 5, 
+            order = TRUE)
+
+# progenitor cells
+FeaturePlot(merge_mice, 
+            features = c("Top2a", "Mki67"), 
+            reduction = "umap.jointpca",
+            split.by = "Species",
+            label = T, repel = T, 
+            pt.size = 0.9, 
+            label.size = 5, 
+            order = TRUE)
+
+# capsule cells
+FeaturePlot(merge_mice, 
+            features = c("Gli1", "Rspo3"), 
+            reduction = "umap.jointpca",
+            split.by = "Species",
+            label = T, repel = T, 
+            pt.size = 0.9, 
+            label.size = 5, 
+            order = TRUE)
+
+# zona glamerulosa
+FeaturePlot(merge_mice, 
+            features = c("Agtr1b", "Cyp11b2"), 
+            reduction = "umap.jointpca",
+            split.by = "Species",
+            label = T, repel = T, 
+            pt.size = 0.9, 
+            label.size = 5, 
+            order = TRUE)
+
+
+# Generate the FeaturePlot with splitting
+split_feature_plot <- FeaturePlot(merge_mice, 
+                                  features = c("Cyp17a1"), 
+                                  reduction = "umap.jointpca",
+                                  #split.by = "Species",
+                                  label = TRUE, 
+                                  repel = TRUE, 
+                                  pt.size = 0.9, 
+                                  label.size = 5, 
+                                  order = TRUE)
+
+# Display the plot ensuring the scale label is shown
+print(split_feature_plot)
+
+# 
+FeaturePlot(merge_mice, 
+            features = c("Cyp17a1"), 
+            reduction = "umap.jointpca",
+            split.by = "Species",
+            label = F, repel = F, 
+            pt.size = 0.9, 
+            #keep.scale = "all",
+            label.size = 5, 
+            order = TRUE)
+
+
+12 - zona reticularis (?)
+17 cluster - progenitor cells
+16 cluster - adrenal capsule
+1, 4, 10, 7 -  zona glamerulosa 
+
+```
+
+```{r}
+# Access the metadata
+metadata <- merge_mice@meta.data
+
+# Create a new column based on conditions applied to the 'clusters' column
+merge_mice$jointpca_annotated <- ifelse(merge_mice$jointpca_clusters == "12", "zona reticularis",
+                       ifelse(merge_mice$jointpca_clusters == "16", "adrenal capsule",
+                       ifelse(merge_mice$jointpca_clusters == "17", "progenitor cells",
+                              "cortex")))
+
+merge_mice$jointpca_annotated %>% unique()
+```
+
+
+```{r, echo=FALSE, fig.height=7, fig.width=12}
+Idents(merge_mice) <- merge_mice$jointpca_annotated
+
+DimPlot(
+  merge_mice,
+  reduction = "umap.jointpca",
+  split.by = "Species",
+  label = F, label.size = 6
+)
+
+```
+
+
+
+Cell composition by samples in clusters
+```{r}
+# Assuming your Seurat object is named 'seurat_obj'
+metadata <- merge_mice@meta.data
+
+# Summarize the data to get cell counts for each sample in each cluster
+cell_counts_df <- metadata %>%
+  group_by(jointpca_clusters, Species) %>% 
+  summarise(count = n())
+
+# Create the bar plot
+ggplot(data = cell_counts_df, aes(x = jointpca_clusters, y = count, fill = Species)) +  
+         geom_bar(stat ="identity", position ="dodge") + 
+         labs(x ="Cluster", y ="Number of Cells", fill ="Species") +  
+         theme_minimal()
+```
+Reduce number of acomys cells randomly
+```{r}
+# total number of mice cells 
+n <- sum(merge_mice$Species == 'Mouse')
+n
+# subset from integrated object equal number of cells within the species
+Idents(merge_mice) <- merge_mice$Species
+reduced_merge_mice <- subset(x = merge_mice, downsample = n)
+
+```
+
+
+```{r}
+metadata <- reduced_merge_mice@meta.data
+
+# Summarize the data to get cell counts for each sample in each cluster
+cell_counts_df <- metadata %>%
+  group_by(jointpca_clusters, Species) %>% 
+  summarise(count = n())
+
+# Create the bar plot
+ggplot(data = cell_counts_df, aes(x = jointpca_clusters, y = count, fill = Species)) +  
+         geom_bar(stat ="identity", position ="dodge") + 
+         labs(x ="Cluster", y ="Number of Cells", fill ="Species") +  
+         theme_minimal()
+```
+
+
+```{r, echo=FALSE, fig.height=7, fig.width=12}
+DimPlot(
+  reduced_merge_mice,
+  reduction = "umap.jointpca",
+  split.by = "Species",
+  label = T, label.size = 6
+)
+```
+
+
+```{r, echo=FALSE, fig.height=7, fig.width=12}
+
+Idents(reduced_merge_mice) <- reduced_merge_mice$jointpca_clusters
+DimPlot(
+  reduced_merge_mice,
+  reduction = "umap.jointpca",
+  split.by = "Species",
+  label = T, label.size = 6
+)
+```
+
+
+
+Get top expressing genes in each cluster  
+```{r}
+Idents(merge_mice) <- merge_mice$jointpca_clusters
+
+expression_table <- as.data.frame(AverageExpression(object = merge_mice)$SCT)
+
+write.xlsx(expression_table, file = "expression_table.xlsx", rowNames = T)
+
+#subsetting clusters
+#sub_obj_0 <- subset(merge_mice, idents = 0)
+
+#head(AverageExpression(object = sub_obj_0, verbose = T)$SCT, 15)
+saveRDS(merge_mice, "merge_mice_300724.RDS")
+```
+
+```{r}
+length(rownames(merge_mice[merge_mice$Species == 'Acomys']) %>% unique())
+acomys <- subset(merge_mice, Species == 'Acomys')
+
+length(rownames(acomys))
+```
+
+
+Cacoa analysis - https://github.com/kharchenkolab/cacoa
+```{r}
+devtools::install_github("kharchenkolab/sccore", ref="dev")
+library(cacoa)
+```
+
+```{r}
+merge_mice$Species %>% unique()
+merge_mice@meta.data$Species
+
+# extract cell ids
+cell_ids <- Cells(merge_mice)
+cell_ids
+
+# extract sample labels
+sample_labels <- merge_mice@meta.data$Species
+
+# create a named vector
+labels_ids <- setNames(sample_labels, cell_ids)
+
+
+# 
+merge_mice@meta.data$orig.ident %>% unique()
+vec <- c('Acomys', 'Acomys', 'Acomys', 'Acomys', 'Acomys', 'Acomys', 'Acomys', 'Acomys', 'Acomys', 'Acomys',
+         'Mouse', 'Mouse', 'Mouse', 'Mouse', 'Mouse', 'Mouse', 'Mouse', 'Mouse', 'Mouse', 'Mouse', 'Mouse', 'Mouse', 
+         'Mouse', 'Mouse', 'Mouse')
+
+names(vec) <- merge_mice@meta.data$orig.ident %>% unique()
+
+
+as.vector(Idents(merge_mice))
+```
+
+```{r}
+# create cavoa object 
+cao <- Cacoa$new(merge_mice, sample.groups=vec, cell.groups=Idents(merge_mice), 
+                 sample.per.cell=labels_ids,
+                 ref.level="Mouse", target.level="Acomys", embedding=merge_mice@reductions$umap.jointpca)
+```
+
+
+```{r}
+cao$estimateCellLoadings()
+
+```
+
+
+SCP pipeline 
+```{r}
+if (!require("renv", quietly = TRUE)) {
+  install.packages("renv")
+}
+dir.create("./SCP_env", recursive = TRUE) # It cannot be the home directory "~" !
+renv::init(project = "./SCP_env", bare = TRUE, restart = TRUE)
+
+```
+
+
+
+
+
+```{r}
+install.packages("igraph")
+library(igraph)
+install.packages('devtools')
+devtools::install_github('kharchenkolab/leidenAlg', build_vignettes = TRUE)
+#devtools::install_github('kharchenkolab/leidenAlg', build_vignettes = TRUE)
+library(leidenAlg)
+devtools::install_github('kharchenkolab/conos')
+library(conos)
+
+library(Matrix)
+library(igraph)
+library(pagoda2)
+library(dplyr)
+library(ggplot2)
+
+```
+
+
+```{r}
+install.packages('p2data', repos='https://kharchenkolab.github.io/drat/', type='source')
+```
+
+```{r}
+  
+dim(raw_counts)
+
+rownames(raw_counts) <- make.unique(rownames(raw_counts))
+
+# creating pagoda2 object
+r <- Pagoda2$new(raw_counts, log.scale=TRUE, n.cores=1)
+
+r$adjustVariance(plot=TRUE, gam.k=10)
+```
+```{r}
+r$calculatePcaReduction(nPcs=50, n.odgenes=3e3)
+
+r$makeKnnGraph(k=40, type='PCA', center=TRUE, distance='cosine')
+
+r$getKnnClusters(method=infomap.community, type='PCA')
+
+
+# make largeViz embedding
+M <- 30
+r$getEmbedding(type='PCA', embeddingType = 'largeVis', M=M, perplexity=30, gamma=1/M)
+
+
+r$plotEmbedding(type='PCA', show.legend=FALSE, mark.groups=TRUE, min.cluster.size=50, shuffle.colors=FALSE, font.size=3, alpha=0.3, title='clusters (largeVis)', plot.theme=theme_bw() + theme(plot.title = element_text(hjust = 0.5)))
+
+```
+```{r}
+
+# t-SNE embedding
+r$getEmbedding(type='PCA', embeddingType='tSNE', perplexity=50, verbose=FALSE)
+r$plotEmbedding(type='PCA', embeddingType='tSNE', show.legend=FALSE, mark.groups=TRUE, min.cluster.size=1, shuffle.colors=FALSE, font.size=3, alpha=0.3, title='clusters (tSNE)', plot.theme=theme_bw() + theme(plot.title = element_text(hjust = 0.5)))
+```
+
+
+```{r}
+# UMAP embedding
+r$getEmbedding(type='PCA', embeddingType='UMAP', perplexity=50, verbose=FALSE)
+r$plotEmbedding(type='PCA', embeddingType='UMAP', show.legend=FALSE, mark.groups=TRUE, min.cluster.size=1, shuffle.colors=FALSE, font.size=3, alpha=0.3, title='clusters (UMAP)', plot.theme=theme_bw() + theme(plot.title = element_text(hjust = 0.5)))
+```
+```{r}
+r$getDifferentialGenes(type='PCA', verbose=TRUE, clusterType='community')
+
+de <- r$diffgenes$PCA[[1]][['17']]
+r$plotGeneHeatmap(genes=rownames(de)[1:15], groups=r$clusters$PCA[[1]])
+```
+
+
+
+
+
+
+
+
+
+
+
+
+Excluding 5 and 12 clusters from integrated object and making new embedding without them. 
+
+```{r, echo=FALSE, fig.height=7, fig.width=12}
+
+DimPlot(merged_no_regression, label = TRUE, label.size = 6)
+
+merged_no_regression$cca_clusters %>% unique()
+Idents(merged_no_regression) <- merged_no_regression$cca_clusters
+Idents(merged_no_regression) %>% unique()
+
+```
+
+
+```{r}
+merged_no_regression
+```
+
+
+```{r}
+# To subset and remove single cluster and keep the remaining clusters for new analysis
+sub_obj <- subset(merged_no_regression, idents = c(5, 12), invert = TRUE)
+sub_obj
+
+```
+
+
+```{r, echo=FALSE, fig.height=7, fig.width=12}
+# re-run PCA and UMAP embeddings
+sub_obj <- RunPCA(sub_obj, npcs = 30, verbose = FALSE)
+sub_obj <- FindNeighbors(sub_obj, reduction = "integrated.cca", dims = 1:30)
+sub_obj <- FindClusters(sub_obj, resolution = c(0.3), cluster.name = "cca_clusters")
+sub_obj <- RunUMAP(sub_obj, reduction = "integrated.cca", dims = 1:30, reduction.name = "umap.cca")
+
+sub_obj$cca_clusters %>% unique()
+Idents(sub_obj) <- sub_obj$cca_clusters
+
+DimPlot(sub_obj, label = TRUE, label.size = 6)
+
+
+```
+
+
+
+```{r, echo=FALSE, fig.height=7, fig.width=12}
+FeaturePlot(sub_obj, 
+            features = c("Dcn", "Col1a1", "Shh", "Rspo3"), 
+            reduction = "umap.cca",
+            label = T, repel = T, 
+            pt.size = 0.9, 
+            label.size = 5, 
+            order = TRUE)
+
+FeaturePlot(merged_no_regression, 
+            features = c("Gli1", "Cyp11b2", "Dlk1"), 
+            reduction = "umap.cca",
+            label = T, repel = T, 
+            pt.size = 0.9, 
+            label.size = 5, 
+            order = TRUE)
+
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+DE genes analysis
+
+```{r}
+###### Clustering analysis
+so[["RNA"]] <- JoinLayers(so[["RNA"]])
+
+# prepare for Finding markers
+sso <- PrepSCTFindMarkers(so, assay = "SCT")
+```
+
+```{r}
+Idents(so) <- so$harmony_clusters
+# find markers for every cluster compared to all remaining cells, report only the positive
+# ones
+so.markers <- FindAllMarkers(so, only.pos = TRUE)
+
+library(openxlsx)
+
+# Perform the filtering
+filtered_markers_so <- so.markers %>%
+  group_by(cluster) %>%
+  dplyr::filter(avg_log2FC > 1) %>%
+  top_n(n = 100, wt = cluster)
+
+# Save to an Excel file
+#write.xlsx(filtered_markers_so, file = "SCT_markers_0.3_040724.xlsx")
+```
+
+
+```{r}
+saveRDS(so, "subset_integration_w/o_cc_regression_190724.RData")
+```
+

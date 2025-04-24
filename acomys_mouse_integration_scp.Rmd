@@ -1,0 +1,1785 @@
+---
+title: "dynverse_acomys"
+author: "Andrey Bydanov"
+date: "2025-02-26"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## 
+```{r}
+# install.packages("devtools")
+devtools::install_github("dynverse/dyno")
+
+library(dyno)
+library(tidyverse)
+```
+```{r}
+# Install the rstudioapi package if not already installed
+if (!requireNamespace("rstudioapi", quietly = TRUE)) {
+  install.packages("rstudioapi")
+}
+
+# Open the JupyterLab URL in the browser
+rstudioapi::viewer("http://localhost:8888/lab")
+```
+
+
+```{r}
+pericort$seurat_clusters %>% table
+
+DimPlot(pericort, label = T)
+```
+
+# Rename cluster annotation of pericort object
+```{r}
+new_annotation <- c(
+  '6' = '1:Mesenchyme-Sparcl1',
+  '7' = '2:Mesenchyme-Dcn',
+  '10' = '3:Mesenchyme-Rgs5',
+  '13' = '4:PROG',
+  '12' = '5:Transition-Wt1',
+  '9' = '6:ZG1-Cyp11b2',
+  '8' = '7:ZG2-Cyp11b2-Ly6d',
+  '0' = '8:ZG3-Ly6d',
+  '3' = '9:ZG4',
+  '5' = '10:ZG5-Hsd3b6',
+  '1' = '11:ZF1-Ptn',
+  '2' = '12:ZF2-Cyp11b1',
+  '4' = '13:ZF3-Cyp11b1-Abcb1b',
+  '11' = '14:ZF4-Sbsn'
+)
+```
+
+```{r}
+pericort$new_annotation <- recode(as.character(pericort$seurat_clusters), !!!new_annotation)
+
+pericort$new_annotation %>% table
+
+# Define the desired order of clusters
+desired_order <- c('1:Mesenchyme-Sparcl1', '2:Mesenchyme-Dcn', '3:Mesenchyme-Rgs5', 
+                   '4:PROG', '5:Transition-Wt1', '6:ZG1-Cyp11b2', '7:ZG2-Cyp11b2-Ly6d', 
+                   '8:ZG3-Ly6d', '9:ZG4', '10:ZG5-Hsd3b6', '11:ZF1-Ptn', '12:ZF2-Cyp11b1', 
+                   '13:ZF3-Cyp11b1-Abcb1b', '14:ZF4-Sbsn')
+
+# Convert the 'seurat_clusters' column to a factor with the desired order
+pericort$new_annotation <- factor(pericort$new_annotation, levels = desired_order)
+
+
+Idents(pericort) <- pericort$new_annotation
+
+# Extract the numeric part of the cluster names for labeling
+numeric_labels <- gsub(":.*", "", as.character(pericort$new_annotation))
+
+# Plot with numeric labels on the plot and full names in the legend
+DimPlot(pericort, label = FALSE) +  # Start with no labels
+  scale_color_discrete(labels = unique(pericort$new_annotation)) +  # Full names in legend
+  geom_text_repel(
+    aes(label = numeric_labels),  # Add numeric labels
+    size = 5,  # Adjust label size
+    box.padding = 0.5  # Adjust spacing around labels
+)
+```
+
+```{r}
+remotes::install_github("satijalab/seurat-wrappers")
+
+library(Seurat)
+library(SeuratWrappers)
+
+```
+
+```{r}
+if (!require("devtools", quietly = TRUE)) {
+  install.packages("devtools")
+}
+devtools::install_github("zhanghao-njmu/SCP")
+```
+
+
+```{r}
+SCP::PrepareEnv()
+
+if (!require("renv", quietly = TRUE)) {
+  install.packages("renv")
+}
+dir.create("~/SCP_env", recursive = TRUE) # It cannot be the home directory "~" !
+renv::init(project = "~/SCP_env", bare = TRUE, restart = TRUE)
+
+```
+
+```{r}
+library(SCP)
+library(BiocParallel)
+register(MulticoreParam(workers = 8, progressbar = TRUE))
+
+downsampled_obj$Species %>% table
+
+mouse_pericort <- subset(downsampled_obj, subset = Species == 'Mouse')
+```
+```{r}
+# sample 26000 cells from final Acomys merged_integrated data
+target_cells <- 26000
+
+# Subset Acomys cells
+acomys_cells <- colnames(merged_integrated)
+length(acomys_cells)
+
+# Downsample Acomys cells to the target number
+set.seed(123)  # For reproducibility
+downsampled_acomys_cells <- sample(acomys_cells, size = target_cells, replace = FALSE)
+length(downsampled_acomys_cells)
+
+# Create a new Seurat object with downsampled Acomys and all Mouse cells
+downsampled_acomys <- subset(merged_integrated, cells = c(downsampled_acomys_cells))
+downsampled_acomys
+```
+```{r}
+mouse_pericort$orig.ident %>% unique() %>% length()
+
+# Split merged mouse and acomys into per-sample Seurat objects
+mouse_split <- SplitObject(mouse_pericort, split.by = "orig.ident")
+acomys_split <- SplitObject(downsampled_acomys, split.by = "orig.ident")
+
+mouse_split <- lapply(mouse_split, function(obj) {
+  obj$species <- "Mouse"
+  return(obj)
+})
+
+acomys_split <- lapply(acomys_split, function(obj) {
+  obj$species <- "Acomys"
+  return(obj)
+})
+
+object_list <- c(mouse_split, acomys_split)
+```
+
+
+# Merge and integrate Acomys and Mouse datasets
+
+```{r}
+library(future)
+options(future.globals.maxSize = 5 * 1024^3)  # Increase to 5GB
+
+DefaultAssay(mouse_pericort) <- "RNA"
+DefaultAssay(downsampled_acomys) <- "RNA"
+
+
+# Step 1: Normalize (returning only variable genes for simplicity & speed)
+object_list <- lapply(object_list, SCTransform, vst.flavor = "v2", verbose = FALSE)
+
+features <- SelectIntegrationFeatures(object.list = object_list, nfeatures = 3000)
+
+object_list <- lapply(object_list, function(x) {
+  if ("integrated" %in% names(x@assays)) {
+    x[["integrated"]] <- NULL  # Remove the integrated assay
+  }
+  return(x)
+})
+
+
+object_list <- PrepSCTIntegration(object.list = object_list, anchor.features = features)
+anchors <- FindIntegrationAnchors(object.list = object_list, normalization.method = "SCT", anchor.features = features)
+integrated_obj <- IntegrateData(anchorset = anchors, normalization.method = "SCT")
+
+saveRDS(anchors, "anchors_final.rds")
+
+# Downstream dimensional reduction
+integrated_obj <- RunPCA(integrated_obj, npcs = 40, verbose = FALSE)
+integrated_obj <- RunUMAP(integrated_obj, dims = 1:40)
+integrated_obj <- FindNeighbors(integrated_obj, dims = 1:40)
+acomys_mouse_integrated <- FindClusters(integrated_obj, resolution = 0.3)
+
+# Save the final object
+saveRDS(acomys_mouse_integrated, file = "integrated_mouse_acomys.RDS")
+rm(integrated_obj)
+
+# Optional: Visualize UMAP by species identity
+DimPlot(acomys_mouse_integrated, group.by = "species", label = TRUE, pt.size = 0.5) +
+  ggtitle("UMAP: Mouse vs Acomys Integrated")
+```
+
+
+```{r}
+# Check assays in each object
+lapply(object_list, function(x) names(x@assays))
+```
+
+
+
+
+```{r, echo=FALSE, fig.height=7, fig.width=12}
+CellDimPlot(
+  srt = downsampled_obj, group.by = c("Species", "cca_clusters"),
+  reduction = "umap.cca", theme_use = "theme_blank"
+)
+```
+
+```{r}
+downsampled_obj$mice_clusters
+
+CellDimPlot(
+  srt = downsampled_obj, group.by = "mice_clusters", stat.by = "Phase",
+  reduction = "UMAP", theme_use = "theme_blank"
+)
+```
+
+```{r, echo=FALSE, fig.height=7, fig.width=12}
+FeatureDimPlot(
+  srt = downsampled_obj, features = c("Mki67", "Gli1", "Top2a", "Dcn"),
+  reduction = "UMAP", theme_use = "theme_blank", split.by = "Species"
+)
+```
+
+```{r, echo=FALSE, fig.height=12, fig.width=12}
+
+# ZG (Zona Glomerulosa)
+FeatureDimPlot(
+  srt = downsampled_obj, features = c("Cyp11b2", "Fdx1", "Hsd3b6", "Ly6d", "Vsnl1", "Steap1", "Ptn"),
+  reduction = "UMAP", theme_use = "theme_blank",  split.by = "Species"
+)
+
+Idents(downsampled_obj) <- downsampled_obj$cca_clusters
+# FeaturePlot(downsampled_obj, 
+#             features = c("Cyp11b2", "Fdx1", "Hsd3b6", "Ly6d", "Vsnl1", "Steap1", "Ptn"), 
+#             reduction = "umap.cca",
+#             split.by = "Species",
+#             label = T, repel = T, 
+#             pt.size = 0.9, 
+#             label.size = 5, 
+#             order = T)
+```
+
+
+
+
+```{r, echo=FALSE, fig.height=12, fig.width=12}
+
+#Transitional Cells (between pericortex and cortex):
+#Rgs5 (regulator of G protein signaling 5)
+#Slpi (secretory leukocyte peptidase inhibitor)
+#Tfpi2 (tissue factor pathway inhibitor 2)
+#Usp53 (ubiquitin specific peptidase 53)
+
+
+FeatureDimPlot(
+  srt = downsampled_obj, features = c("Rgs5", "Slpi", "Tfpi2", "Usp53"),
+  reduction = "UMAP", theme_use = "theme_blank", split.by = "Species"
+)
+
+```
+
+```{r, echo=FALSE, fig.height=15, fig.width=15}
+
+# Vascular Smooth Muscle Cells (VSMCs):
+# Acta2 (alpha smooth muscle actin)
+# Tagln (transgelin)
+# Rgs5 (regulator of G protein signaling 5)
+# Myh11 (myosin heavy chain 11)
+# Slpi (secretory leukocyte peptidase inhibitor)
+# Tfpi2 (tissue factor pathway inhibitor 2)
+
+
+FeatureDimPlot(
+  srt = downsampled_obj, features = c("Acta2", "Tagln", "Rgs5", "Myh11", "Slpi", "Tfpi2"),
+  reduction = "UMAP", theme_use = "theme_blank", split.by = "Species"
+)
+
+```
+
+
+```{r, echo=FALSE, fig.height=12, fig.width=12}
+
+# Pericortical Mesenchymal Cells:
+# Sparcl1 (SPARC-like 1)
+# Col1a1 (collagen type I alpha 1 chain)
+# Col1a2 (collagen type I alpha 2 chain)
+# Wt1 (Wilms tumor 1)
+# Gli1 (GLI family zinc finger 1)
+# Ptch1 (patched 1)
+# Rspo3 (R-spondin 3)
+# Dcn (decorin)
+
+
+FeatureDimPlot(
+  srt = downsampled_obj, features = c("Sparcl1", "Col1a1", "Col1a2", "Wt1", "Gli1", 
+                                      "Ptch1", "Rspo3", "Dcn"),
+  reduction = "UMAP", theme_use = "theme_blank", split.by = "Species"
+)
+
+```
+
+```{r, echo=FALSE, fig.height=12, fig.width=12}
+
+
+FeatureDimPlot(
+  srt = downsampled_obj, features = c("Ccdc80", "Fbln1", "Fbn1", "Igfbp6", "Gsn", "Agtr1b"),
+  reduction = "UMAP", theme_use = "theme_blank", split.by = "Species"
+)
+
+```
+
+
+
+```{r, echo=FALSE, fig.height=12, fig.width=12}
+
+# Zona Glomerulosa (ZG):
+# Cyp11b2 (aldosterone synthase)
+# Fdx1 (ferredoxin 1)
+# Hsd3b6 (3-beta-hydroxysteroid dehydrogenase 6)
+# Ly6d (lymphocyte antigen 6 complex, locus D)
+# Vsnl1 (visinin-like 1)
+# Steap1 (STEAP family member 1)
+# Ptn (pleiotrophin)
+
+
+FeatureDimPlot(
+  srt = downsampled_obj, features = c("Cyp11b2", "Fdx1", "Hsd3b6", "Ly6d", "Vsnl1", 
+                                      "Steap1", "Ptn"),
+  reduction = "UMAP", theme_use = "theme_blank", split.by = "Species"
+)
+
+```
+
+
+```{r, echo=FALSE, fig.height=12, fig.width=12}
+
+#ZF (Zona Fasciculata):
+#Cyp11b1 (11-beta-hydroxylase)
+#Akr1cl (aldo-keto reductase family 1, member C-like)
+#Abcb1b (ATP-binding cassette, sub-family B, member 1B)
+#Sbsn (subbasal zone protein)
+#Meg3 (maternally expressed 3)
+
+
+FeatureDimPlot(
+  srt = downsampled_obj, features = c("Cyp11b1", "Akr1cl", "Abcb1b", "Sbsn", "Meg3"),
+  reduction = "UMAP", theme_use = "theme_blank", split.by = "Species"
+)
+
+```
+
+```{r, echo=FALSE, fig.height=12, fig.width=12}
+
+# X-Zone (Inner Cortex in Mice):
+# Cyp11b1 (11-beta-hydroxylase)
+# Cyp17a1 (17-alpha-hydroxylase)
+# Hsd3b6 (3-beta-hydroxysteroid dehydrogenase 6)
+# Sult2a1 (sulfotransferase family 2A member 1)
+
+
+FeatureDimPlot(
+  srt = downsampled_obj, features = c("Cyp11b1", "Cyp17a1", "Hsd3b6", "Sult1e1", "Slc40a1", "Gsta3"),
+  reduction = "UMAP", theme_use = "theme_blank", split.by = "Species"
+)
+
+```
+
+```{r, echo=FALSE, fig.height=12, fig.width=12}
+
+# Adrenocortical Progenitors (in Cortex):
+# Nr5a1 (nuclear receptor subfamily 5 group A member 1)
+# Shh (sonic hedgehog)
+# Wnt4 (Wnt family member 4)
+# Ezh2 (enhancer of zeste 2 polycomb repressive complex 2 subunit)
+# Cenpm (centromere protein M)
+# H2afx (H2A histone family member X)
+# Stmn1 (stathmin 1)
+
+FeatureDimPlot(
+  srt = downsampled_obj, features = c("Nr5a1", "Shh", "Wnt4", "Ezh2", "Cenpm", "H2afx", "Cyb5a"),
+  reduction = "UMAP", theme_use = "theme_blank", split.by = "Species"
+)
+
+```
+
+
+```{r}
+Idents(downsampled_obj) <- downsampled_obj$cca_clusters
+DimPlot(downsampled_obj, split.by = "Species")
+```
+
+```{r, echo=FALSE, fig.height=5, fig.width=8}
+downsampled_obj@meta.data -> metadata
+
+cluster_composition <- metadata %>%
+  group_by(cca_clusters, Species) %>%
+  summarize(count = dplyr::n()) %>%
+  arrange(desc(count))
+
+metadata %>%
+  group_by(cca_clusters) %>%
+  summarize(count = dplyr::n()) %>%
+  arrange(desc(count)) %>% View()
+
+
+cluster_composition$cca_clusters <- factor(
+  cluster_composition$cca_clusters, 
+  levels = c(0, 1, 2, 3, 4, 5, 6, 7, 8, 9)  
+)
+
+
+cluster_composition <- cluster_composition %>%
+  group_by(cca_clusters) %>%
+  mutate(proportion = count / sum(count))
+
+
+cluster_composition[cluster_composition$cca_clusters == 9, ]
+
+# Visualize compositional data
+ggplot(cluster_composition, aes(as.factor(cca_clusters), count, fill = Species)) +
+  geom_bar(stat = "identity", position = "stack") +
+  geom_text(
+    aes(
+      label = scales::percent(proportion, 1),
+      vjust = ifelse(cca_clusters %in% 7:10 & Species == "Acomys", -0.5, 1.5)  # Adjust vjust for clusters 7–10
+    ),
+    position = position_stack(vjust = 0.5),
+    size = 3, color = "black"
+  ) +
+  labs(
+    title = "Cluster composition by Species within all samples",
+    x = "Cluster", 
+    y = "Cell count",
+    fill = "Species"
+  ) +
+  theme(legend.position = "bottom")
+
+```
+
+
+
+```{r, echo=FALSE, fig.height=7, fig.width=15}
+# Visualize co-expression of two features simultaneously
+FeaturePlot(downsampled_obj, features = c("Cyp11b2", "Cyp17a1"), blend=T)
+```
+
+```{r}
+downsampled_acomys <- subset(downsampled_obj, subset = Species == 'Acomys')
+DimPlot(downsampled_acomys, label = T)
+```
+```{r}
+FeaturePlot(downsampled_acomys, features = c("Cyb5a"))
+```
+
+```{r}
+FeaturePlot(downsampled_acomys, features = "Cyp17a1") 
+```
+
+```{r}
+# DotPlot for visualization
+DotPlot(downsampled_acomys, features = c("Cyp17a1", "Hsd3b2", "Akr1c3", "Cyp11b2", "Cyp21a1", "Sult2a1", "Cyb5a", "Cdkn1c", "S100a10", 
+                                         "Dgkk"), cols = c("blue", "yellow")) +  
+  RotatedAxis() 
+```
+
+
+
+
+# Subset clusters with ZG cell type - 1, 6, 8
+
+```{r}
+# Example: Subset clusters 1, 6, and 8 (adjust based on your cluster IDs)
+clusters_to_keep <- c(1, 6, 8)  
+subset_obj <- subset(downsampled_acomys, idents = clusters_to_keep)
+
+# 2. Re-run SCTransform on the subset
+subset_obj <- SCTransform(subset_obj, vst.flavor = "v2",
+                            return.only.var.genes = FALSE)  # Keep all genes in scale.data 
+
+
+
+
+
+
+# Identify conserved or differential markers (adjust parameters as needed)
+cluster_markers <- FindAllMarkers(
+  subset_obj,
+  only.pos = TRUE,          # Keep only upregulated markers
+  min.pct = 0.25,           # Gene detected in at least 25% of cells
+  logfc.threshold = 0.5,    # Minimum log2 fold change
+  test.use = "wilcox"       # Default test (alternatives: "DESeq2", "MAST")
+)
+
+# View top 5 markers per cluster
+top_markers <- cluster_markers %>%
+  group_by(cluster) %>%
+  slice_max(n = 10, order_by = avg_log2FC)
+
+```
+
+```{r, echo=FALSE, fig.height=7, fig.width=12}
+DoHeatmap(subset_obj, features = top_markers$gene) + NoLegend()
+DotPlot(subset_obj, features = unique(top_markers$gene)) + 
+  RotatedAxis()
+FeaturePlot(subset_obj, features = c("Fggy", "S100a6", "Kcnq5", "Efna5", "Cd81", "Acoxl"), ncol = 3)
+DimPlot(subset_obj)
+```
+
+
+
+
+```{r, echo=FALSE, fig.height=7, fig.width=15}
+
+
+downsampled_obj
+
+ht <- GroupHeatmap(
+  srt = downsampled_obj,
+  features = c(
+   "Dcn", "Col1a1", "Shh", "Rspo3", "Gli1", "Cyp11b2", "Dlk1", "Cyp17a1"
+  ),
+  group.by = c("cca_clusters", "Species"),
+  heatmap_palette = "YlOrRd",
+  cell_annotation = c("Phase", "S.Score"),
+  cell_annotation_palette = c("Dark2", "Paired"),
+  show_row_names = TRUE, row_names_side = "left",
+  add_dot = TRUE, add_reticle = TRUE
+)
+print(ht$plot)
+```
+
+```{r}
+downsampled_obj <- RunCellQC(srt = downsampled_obj)
+CellDimPlot(srt = downsampled_obj, group.by = "CellQC", reduction = "UMAP")
+```
+
+```{r}
+CellDimPlot3D(srt = downsampled_obj, group.by = "cca_clusters")
+```
+
+```{r, echo=FALSE, fig.height=7, fig.width=15}
+
+# Cell projection between single-cell datasets
+downsampled_obj$numeric_labels
+
+pericort_rename <- RenameFeatures(
+  srt = pericort,
+  newnames = make.unique(capitalize(rownames(pericort[["RNA"]]), force_tolower = TRUE)),
+  assays = "RNA"
+)
+srt_query <- RunKNNMap(srt_query = downsampled_obj, srt_ref = pericort, ref_umap = "umap")
+ProjectionPlot(
+  srt_query = srt_query, srt_ref = pericort_rename,
+  query_group = "cca_clusters", ref_group = "new_annotation"
+)
+
+pericort_rename$new_annotation
+```
+
+
+
+```{r, echo=FALSE, fig.height=7, fig.width=15}
+# Cell annotation using single-cell datasets
+pericort$new_annotation
+
+downsampled_obj <- RunKNNPredict(
+  srt_query = downsampled_obj, srt_ref = pericort,
+  ref_group = "new_annotation", filter_lowfreq = 20
+)
+CellDimPlot(srt = downsampled_obj, group.by = "KNNPredict_classification", reduction = "UMAP", label = TRUE, split.by = "Species")
+```
+
+```{r}
+# Check cell names in the query object (downsampled_obj)
+head(colnames(downsampled_obj))
+
+# Check cell names in the reference object (pericort)
+head(colnames(pericort))
+
+# Check cell names in the metadata
+head(rownames(downsampled_obj@meta.data))  # Query metadata
+head(rownames(pericort@meta.data)) # Reference metadata
+
+downsampled_obj$orig.ident %>% unique()
+pericort$orig.ident %>% unique()
+```
+
+
+
+```{r, echo=FALSE, fig.height=7, fig.width=15}
+downsampled_obj$cca_clusters_g <- paste0("g", downsampled_obj$cca_clusters)
+pericort$new_annotation_g <- paste0("g", pericort$new_annotation)
+
+sum(is.na(downsampled_obj$cca_clusters_g))
+sum(is.na(pericort$new_annotation_g))
+
+sum(colnames(pericort) %in% colnames(downsampled_obj))
+
+ht <- CellCorHeatmap(
+  srt_query = downsampled_obj, srt_ref = pericort,
+  query_group = "cca_clusters_g", ref_group = "new_annotation_g",
+  nlabel = 3, label_by = "row"#, show_row_names = TRUE, show_column_names = TRUE
+)
+print(ht$plot)
+```
+
+
+
+# PAGA Analysis
+```{r}
+downsampled_obj <- RunPAGA(
+  srt = downsampled_obj, group_by = "cca_clusters",
+  linear_reduction = "PCA", nonlinear_reduction = "UMAP"
+)
+PAGAPlot(srt = downsampled_obj, reduction = "UMAP", label = TRUE, label_insitu = TRUE, label_repel = TRUE)
+```
+
+```{r}
+remotes::install_github("Winnie09/GPTCelltype")
+install.packages("openai")
+```
+
+
+
+
+
+
+# Human cells
+
+```{r}
+DimPlot(human_cortex)
+```
+
+# Before integration we need to map gene names to each other - human to mouse/mouse to human
+```{r}
+#install.packages("biomaRt")
+library(biomaRt)
+
+# Define the mouse and human datasets in Ensembl
+human_mart <- useMart("ensembl", dataset = "hsapiens_gene_ensembl", host = "https://dec2021.archive.ensembl.org/")
+mouse_mart <- useMart("ensembl", dataset = "mmusculus_gene_ensembl", host = "https://dec2021.archive.ensembl.org/")
+
+# Get mouse gene names
+mouse_genes <- rownames(merged_acomys)
+
+# Map mouse genes to human orthologs
+orthologs <- getLDS(
+  attributes = c("mgi_symbol"),  # Mouse gene symbols
+  filters = "mgi_symbol",
+  values = mouse_genes,
+  mart = mouse_mart,
+  attributesL = c("hgnc_symbol"),  # Human gene symbols
+  martL = human_mart
+)
+
+# View the ortholog mapping
+head(orthologs)
+```
+
+
+
+
+
+
+# Add selected cells previously labeled as immune cells to the acomys object
+```{r}
+selected_cells
+
+selected_subset <- subset(merged_SCT_cc_regressed, cells = selected_cells)
+
+DefaultAssay(selected_subset) <- DefaultAssay(merged_acomys) 
+
+dim(merged_acomys)       # e.g., 2000 genes x 5000 cells
+dim(selected_subset)     # e.g., 2000 genes x 100 cells
+
+identical(rownames(merged_acomys), rownames(selected_subset))  # Should return TRUE
+
+# Check active assays
+# Reset default assay if needed
+DefaultAssay(merged_acomys) <- "SCT"
+DefaultAssay(selected_subset) <- "SCT"
+
+# If different, standardize them:
+DefaultAssay(selected_subset) <- DefaultAssay(merged_acomys)
+
+# Compare metadata column names
+setdiff(names(merged_acomys@meta.data), names(selected_subset@meta.data))
+
+# Remove problematic columns if needed
+selected_subset@meta.data <- selected_subset@meta.data[, 
+  intersect(names(merged_acomys@meta.data), names(selected_subset@meta.data))]
+
+# does not work
+merged_final_acomys <- merge(merged_acomys, y=list(selected_subset))
+
+
+
+```
+```{r}
+if (!requireNamespace("remotes", quietly = TRUE)) {
+  install.packages("remotes")
+}
+remotes::install_github("mojaveazure/seurat-disk", force = T)
+
+install.packages("hdf5r", type = "source")
+```
+
+
+
+```{r}
+if (!requireNamespace("BiocManager", quietly = TRUE)) {
+    install.packages("BiocManager")
+}
+BiocManager::install(c("SingleCellExperiment", "SummarizedExperiment", "S4Vectors"))
+
+remotes::install_github("settylab/convert2anndata")
+
+
+library(anndata)
+library(convert2anndata)
+
+# Convert to SingleCellExperiment if necessary
+sce <- convert_seurat_to_sce(merged_acomys)
+
+# Convert to AnnData
+ad <- convert_to_anndata(sce, assayName = "counts", useAltExp = TRUE)
+
+# Save the AnnData object
+write_h5ad(ad, "merged_acomys.h5ad")
+
+
+#####
+sce <- convert_seurat_to_sce(selected_subset)
+ad <- convert_to_anndata(sce, assayName = "counts", useAltExp = TRUE)
+write_h5ad(ad, "selected_subset.h5ad")
+
+```
+
+
+```{python}
+import scanpy as sc
+
+adata1 = sc.read_h5ad("merged_acomys.h5ad")
+adata2 = sc.read_h5ad("selected_subset.h5ad")
+
+adata1.var_names_make_unique()
+adata2.var_names_make_unique()
+
+import anndata as ad
+
+adata_combined = ad.concat([adata1, adata2], join='outer', label='batch', keys=['sample1', 'sample2'], index_unique='-')
+
+adata_combined.write("merged_final_acomys.h5ad")
+#adata_combined.write("merged_final_acomys_gzip.h5ad", compression="gzip")
+```
+
+
+```{r}
+library(reticulate)
+library(sceasy)
+#remotes::install_github("pmbio/MuDataSeurat")
+library(MuDataSeurat)
+
+# with mudataseurat
+merged_final_acomys <- ReadH5AD("merged_final_acomys.h5ad")
+
+# Convert .h5ad to Seurat
+merged_final_acomys <- sceasy::convertFormat("merged_final_acomys.h5ad", from="anndata", to="seurat")
+
+merged_final_acomys <- readRDS("merged_final_acomys.rds")
+```
+```{r}
+# Install required packages
+if (!requireNamespace("BiocManager", quietly = TRUE))
+    install.packages("BiocManager")
+BiocManager::install("zellkonverter")
+BiocManager::install("LoomExperiment")
+
+# Load libraries
+library(zellkonverter)
+library(Seurat)
+
+# Read .h5ad file and convert to SingleCellExperiment (SCE)
+sce <- readH5AD("merged_final_acomys.h5ad")
+
+assayNames(sce)
+
+# Convert SCE to Seurat
+merged_final_acomys <- as.Seurat(sce, counts = "X", data = "X")
+```
+```{r}
+merged_final_acomys$orig.ident %>% table
+Idents(merged_final_acomys) <- merged_final_acomys$orig.ident
+
+DimPlot(merged_final_acomys)
+```
+
+
+```{r}
+# Check how many genes are actually present
+mean(mouse.s.genes %in% rownames(merged_list[[1]]))
+
+mean(mouse.g2m.genes %in% rownames(merged_list[[1]]))
+
+# Example: Check if "Cdk1" exists under a different name
+grep("Cdk1", rownames(merged_list[[1]]), value = TRUE)
+
+# Check if "Cdk1" is stored in a modified format
+"Cdk1" %in% rownames(merged_list[[1]])  # Should return TRUE
+"CDK1" %in% rownames(merged_list[[1]])  # Check uppercase
+"cdk1" %in% rownames(merged_list[[1]])  # Check lowercase
+
+grep("^Cdk1$", rownames(merged_list[[1]]), value = TRUE, ignore.case = TRUE)
+
+# Check how "Cdk1" appears in your gene lists
+mouse.s.genes[mouse.s.genes %in% c("Cdk1", "CDK1", "cdk1")]
+mouse.g2m.genes[mouse.g2m.genes %in% c("Cdk1", "CDK1", "cdk1")]
+
+# Keep only genes that are actually in your dataset
+valid_s_genes <- intersect(mouse.s.genes, rownames(merged_list[[1]]))
+valid_g2m_genes <- intersect(mouse.g2m.genes, rownames(merged_list[[1]]))
+
+# Check if "Cdk1" is retained (should be TRUE)
+"Cdk1" %in% valid_g2m_genes
+"Cdk1" %in% VariableFeatures(merged_list[[1]])
+
+which(tolower(rownames(merged_list[[1]])) == "cdk1")
+grep("cdk1", rownames(merged_list[[1]]), ignore.case = TRUE, value = TRUE)
+```
+
+
+
+# Perform Integration of merged acomys cells 
+
+
+```{r}
+# Check if SCT model is intact
+#sct_model <- merged_final_acomys@assays$SCT@SCTModel.list
+#print(sct_model)
+
+# Check PCA is properly stored
+#print(merged_final_acomys@reductions$pca)
+
+
+# Split by batch (replace "batch_column" with your sample/batch metadata column)
+merged_list <- SplitObject(merged_final_acomys, split.by = "orig.ident")
+
+# define CC genes
+# Human cell cycle genes
+#cc.genes <- Seurat::cc.genes.updated.2019
+#all.cc.genes <- unique(c(cc.genes$s.genes, cc.genes$g2m.genes))
+
+# Load biomaRt
+library(biomaRt)
+
+# Connect to Ensembl
+# Define the mouse and human datasets in Ensembl
+#human_mart <- useMart("ensembl", dataset = "hsapiens_gene_ensembl", host = "https://dec2021.archive.ensembl.org/")
+#mouse_mart <- useMart("ensembl", dataset = "mmusculus_gene_ensembl", host = "https://dec2021.archive.ensembl.org/")
+
+
+
+# Map to mouse
+#genes.mapped <- getLDS(attributes = c("hgnc_symbol"), filters = "hgnc_symbol",
+#                       values = all.cc.genes, mart = human_mart,
+#                       attributesL = c("mgi_symbol"), martL = mouse_mart,
+#                       uniqueRows = TRUE)
+
+# Extract mapped genes
+#mouse.s.genes <- genes.mapped$MGI.symbol[genes.mapped$HGNC.symbol %in% cc.genes$s.genes]
+#mouse.g2m.genes <- genes.mapped$MGI.symbol[genes.mapped$HGNC.symbol %in% cc.genes$g2m.genes]
+
+# Score cell cycle in each object
+merged_list <- lapply(merged_list, function(obj) {
+  CellCycleScoring(
+    object = obj,
+    s.features = valid_s_genes,
+    g2m.features = valid_g2m_genes
+  )
+})
+
+# run SCTransform with regression cell cycle effect
+merged_list <- lapply(merged_list, function(obj) {
+  SCTransform(
+    obj,
+    vars.to.regress = c("S.Score", "G2M.Score"),
+    return.only.var.genes = FALSE,
+    verbose = TRUE
+  )
+})
+
+
+# Select integration features
+features <- SelectIntegrationFeatures(merged_list)
+merged_list <- PrepSCTIntegration(object.list = merged_list, anchor.features = features, verbose = TRUE)
+
+anchors <- FindIntegrationAnchors(merged_list, anchor.features = features, normalization.method = "SCT")
+merged_integrated <- IntegrateData(anchors, normalization.method = "SCT")
+
+
+# Set default assay and proceed to PCA/UMAP
+DefaultAssay(merged_integrated) <- "integrated"
+
+merged_integrated <- ScaleData(merged_integrated, verbose = TRUE)
+
+VariableFeatures(merged_integrated) <- features
+
+merged_integrated <- RunPCA(merged_integrated, verbose = TRUE)
+
+merged_integrated <- RunUMAP(merged_integrated, dims = 1:30)
+
+merged_integrated <- FindNeighbors(merged_integrated, dims = 1:30)
+merged_integrated <- FindClusters(merged_integrated, resolution = 0.5)
+
+DimPlot(merged_integrated, reduction = "umap", label = TRUE, group.by = "seurat_clusters")
+
+Idents(merged_integrated) <- merged_integrated$orig.ident
+
+saveRDS(merged_integrated, "merged_final_integrated_acomys.RDS")
+#save.image("merged_final_acomys_170425.RData")
+rm(merged_list)
+```
+
+
+```{r, echo=FALSE, fig.height=7, fig.width=10}
+Idents(merged_integrated) <- merged_integrated$seurat_clusters
+DefaultAssay(merged_integrated) <- "SCT"
+length(rownames(merged_integrated))
+
+
+DimPlot(merged_integrated, reduction = "umap", label = TRUE, group.by = "seurat_clusters")
+DimPlot(merged_integrated, reduction = "umap", label = TRUE, group.by = "orig.ident")
+DimPlot(merged_integrated, reduction = "umap", label = TRUE, group.by = "Phase")
+
+```
+
+```{r}
+CellDimPlot3D(srt = merged_integrated, group.by = "seurat_clusters")
+```
+
+
+```{r}
+c("Mki67", "Gli1", "Top2a", "Dcn") %in% rownames(merged_integrated)
+length(rownames(merged_integrated))
+```
+
+
+```{r, echo=FALSE, fig.height=7, fig.width=12}
+FeatureDimPlot(
+  srt = merged_integrated, features = c("Mki67", "Gli1", "Top2a", "Dcn"),
+  reduction = "UMAP", theme_use = "theme_blank", assay = "RNA"
+)
+
+# ZG (Zona Glomerulosa)
+FeatureDimPlot(
+  srt = merged_integrated, features = c("Cyp11b2", "Fdx1", "Hsd3b6", "Ly6d", "Vsnl1", "Steap1", "Ptn"),
+  reduction = "UMAP", theme_use = "theme_blank"
+)
+
+
+#Transitional Cells (between pericortex and cortex):
+#Rgs5 (regulator of G protein signaling 5)
+#Slpi (secretory leukocyte peptidase inhibitor)
+#Tfpi2 (tissue factor pathway inhibitor 2)
+#Usp53 (ubiquitin specific peptidase 53)
+
+
+FeatureDimPlot(
+  srt = merged_integrated, features = c("Rgs5", "Slpi", "Tfpi2", "Usp53"),
+  reduction = "UMAP", theme_use = "theme_blank", assay = "RNA"
+)
+
+
+# Vascular Smooth Muscle Cells (VSMCs):
+# Acta2 (alpha smooth muscle actin)
+# Tagln (transgelin)
+# Rgs5 (regulator of G protein signaling 5)
+# Myh11 (myosin heavy chain 11)
+# Slpi (secretory leukocyte peptidase inhibitor)
+# Tfpi2 (tissue factor pathway inhibitor 2)
+
+
+FeatureDimPlot(
+  srt = merged_integrated, features = c("Acta2", "Tagln", "Rgs5", "Myh11", "Slpi", "Tfpi2"),
+  reduction = "UMAP", theme_use = "theme_blank", assay = "RNA"
+)
+
+
+# Pericortical Mesenchymal Cells:
+# Sparcl1 (SPARC-like 1)
+# Col1a1 (collagen type I alpha 1 chain)
+# Col1a2 (collagen type I alpha 2 chain)
+# Wt1 (Wilms tumor 1)
+# Gli1 (GLI family zinc finger 1)
+# Ptch1 (patched 1)
+# Rspo3 (R-spondin 3)
+# Dcn (decorin)
+
+
+FeatureDimPlot(
+  srt = merged_integrated, features = c("Sparcl1", "Col1a1", "Col1a2", "Wt1", "Gli1", 
+                                      "Ptch1", "Rspo3", "Dcn"),
+  reduction = "UMAP", theme_use = "theme_blank", assay = "RNA"
+)
+
+
+
+# Zona Glomerulosa (ZG):
+# Cyp11b2 (aldosterone synthase)
+# Fdx1 (ferredoxin 1)
+# Hsd3b6 (3-beta-hydroxysteroid dehydrogenase 6)
+# Ly6d (lymphocyte antigen 6 complex, locus D)
+# Vsnl1 (visinin-like 1)
+# Steap1 (STEAP family member 1)
+# Ptn (pleiotrophin)
+
+
+FeatureDimPlot(
+  srt = merged_integrated, features = c("Cyp11b2", "Fdx1", "Hsd3b6", "Ly6d", "Vsnl1", 
+                                      "Steap1", "Ptn"),
+  reduction = "UMAP", theme_use = "theme_blank"
+)
+
+
+# ZR (Zona Reticularis)
+# Cyp17a1, Akr1c3
+
+FeatureDimPlot(
+  srt = merged_integrated, features = c("Cyp17a1", "Akr1c3"),
+  reduction = "UMAP", theme_use = "theme_blank"
+)
+
+
+
+
+#ZF (Zona Fasciculata):
+#Cyp11b1 (11-beta-hydroxylase)
+#Akr1cl (aldo-keto reductase family 1, member C-like)
+#Abcb1b (ATP-binding cassette, sub-family B, member 1B)
+#Sbsn (subbasal zone protein)
+#Meg3 (maternally expressed 3)
+
+
+FeatureDimPlot(
+  srt = merged_integrated, features = c("Cyp11b1", "Akr1cl", "Abcb1b", "Sbsn", "Meg3"),
+  reduction = "UMAP", theme_use = "theme_blank"
+)
+
+
+
+# X-Zone (Inner Cortex in Mice):
+# Cyp11b1 (11-beta-hydroxylase)
+# Cyp17a1 (17-alpha-hydroxylase)
+# Hsd3b6 (3-beta-hydroxysteroid dehydrogenase 6)
+# Sult2a1 (sulfotransferase family 2A member 1)
+
+
+FeatureDimPlot(
+  srt = merged_integrated, features = c("Cyp11b1", "Cyp17a1", "Hsd3b6", "Sult1e1", "Slc40a1", "Gsta3"),
+  reduction = "UMAP", theme_use = "theme_blank"
+)
+
+
+# Adrenocortical Progenitors (in Cortex):
+# Nr5a1 (nuclear receptor subfamily 5 group A member 1)
+# Shh (sonic hedgehog)
+# Wnt4 (Wnt family member 4)
+# Ezh2 (enhancer of zeste 2 polycomb repressive complex 2 subunit)
+# Cenpm (centromere protein M)
+# H2afx (H2A histone family member X)
+# Stmn1 (stathmin 1)
+
+FeatureDimPlot(
+  srt = merged_integrated, features = c("Nr5a1", "Shh", "Wnt4", "Ezh2", "Cenpm", "H2afx", "Cyb5a"),
+  reduction = "UMAP", theme_use = "theme_blank", assay = "RNA"
+)
+
+
+```
+
+
+
+
+# find all clusters markers
+
+```{r}
+DefaultAssay(merged_integrated) <- "SCT"
+Idents(merged_integrated) <- "seurat_clusters"
+
+merged_integrated <- PrepSCTFindMarkers(merged_integrated)
+
+markers <- FindAllMarkers(
+  merged_integrated,
+  only.pos = TRUE,
+  test.use = "wilcox",
+  min.pct = 0.25,
+  logfc.threshold = 0.25
+)
+
+library(openxlsx)
+
+# Split markers by cluster
+markers_by_cluster <- split(markers, markers$cluster)
+
+# Create workbook
+wb <- createWorkbook()
+for (cluster in names(markers_by_cluster)) {
+  addWorksheet(wb, paste0("Cluster_", cluster))
+  writeData(wb, sheet = paste0("Cluster_", cluster), markers_by_cluster[[cluster]])
+}
+
+saveWorkbook(wb, file = "final_acomys_Markers_By_Cluster.xlsx", overwrite = TRUE)
+```
+
+
+
+
+
+
+
+
+# Human cortex integration with Acomys Cortex cells
+
+```{r}
+human_cortex$orig.ident %>% table
+merged_integrated$orig.ident %>% table
+
+length(rownames(human_cortex))
+length(rownames(merged_integrated))
+
+
+human_cortex$orig.ident %>% unique() %>% length()
+
+# Split merged mouse and acomys into per-sample Seurat objects
+human_split <- SplitObject(human_cortex, split.by = "orig.ident")
+acomys_split <- SplitObject(merged_integrated, split.by = "orig.ident")
+
+human_split <- lapply(human_split, function(obj) {
+  obj$species <- "Human"
+  return(obj)
+})
+
+acomys_split <- lapply(acomys_split, function(obj) {
+  obj$species <- "Acomys"
+  return(obj)
+})
+
+object_list <- c(human_split, acomys_split)
+length(object_list)
+
+
+```
+
+
+
+
+```{r}
+library(future)
+options(future.globals.maxSize = 5 * 1024^3)  # Increase to 5GB
+
+
+# Step 1: Normalize (returning only variable genes for simplicity & speed)
+object_list <- lapply(object_list, SCTransform, vst.flavor = "v2", verbose = FALSE)
+
+features <- SelectIntegrationFeatures(object.list = object_list, nfeatures = 3000)
+
+object_list <- lapply(object_list, function(x) {
+  if ("integrated" %in% names(x@assays)) {
+    x[["integrated"]] <- NULL  # Remove the integrated assay
+  }
+  return(x)
+})
+
+
+object_list <- PrepSCTIntegration(object.list = object_list, anchor.features = features)
+anchors <- FindIntegrationAnchors(object.list = object_list, normalization.method = "SCT", anchor.features = features)
+integrated_obj <- IntegrateData(anchorset = anchors, normalization.method = "SCT")
+
+saveRDS(anchors, "human_acomys_anchors_final.rds")
+
+# Downstream dimensional reduction
+integrated_obj <- RunPCA(integrated_obj, npcs = 40, verbose = FALSE)
+integrated_obj <- RunUMAP(integrated_obj, dims = 1:40)
+integrated_obj <- FindNeighbors(integrated_obj, dims = 1:40)
+acomys_human_integrated <- FindClusters(integrated_obj, resolution = 0.3)
+
+# Save the final object
+saveRDS(acomys_human_integrated, file = "integrated_human_acomys.RDS")
+rm(integrated_obj)
+
+# Optional: Visualize UMAP by species identity
+DimPlot(acomys_human_integrated, group.by = "Species", label = TRUE, pt.size = 0.5) +
+  ggtitle("UMAP: Human vs Acomys Integrated")
+```
+```{r}
+acomys_human_integrated$Species %>% table
+acomys_human_integrated$Species <- ifelse(str_detect(acomys_human_integrated$orig.ident, "Ac_"), "Acomys", "Human")
+```
+
+
+
+# We need to map gene names between human and mouse objects
+```{r}
+if (!requireNamespace("biomaRt", quietly = TRUE)) {
+  install.packages("biomaRt")
+}
+library(biomaRt)
+
+# Use the Ensembl archive site
+ensembl <- useMart("ENSEMBL_MART_ENSEMBL", host = "https://dec2021.archive.ensembl.org")
+human <- useDataset("hsapiens_gene_ensembl", mart = ensembl)
+mouse <- useDataset("mmusculus_gene_ensembl", mart = ensembl)
+```
+
+```{r}
+# Get mouse gene names
+mouse_genes <- rownames(merged_acomys)
+human_genes <- rownames(human_cortex)
+
+
+# Retrieve corresponding mouse orthologs
+gene_mapping <- getLDS(
+  attributes = c("hgnc_symbol"),  # Human gene symbols
+  filters = "hgnc_symbol", 
+  values = human_genes, 
+  mart = human_mart,
+  attributesL = c("mgi_symbol"),  # Mouse gene symbols
+  martL = mouse_mart
+)
+
+# Display results
+print(gene_mapping)
+gene_mapping[gene_mapping$Mouse_Gene == 'Hsd3b6',]
+```
+
+```{r}
+# Rename columns for clarity
+colnames(gene_mapping) <- c("Human_Gene", "Mouse_Gene")
+
+# Filter out unmapped genes
+gene_mapping <- gene_mapping %>% filter(Mouse_Gene != "")
+
+# Create a named vector for mapping
+gene_map <- setNames(gene_mapping$Mouse_Gene, gene_mapping$Human_Gene)
+
+# Update rownames in the human Seurat object
+new_rownames <- gene_map[rownames(human_cortex)]
+rownames(human_cortex) <- ifelse(is.na(new_rownames), rownames(human_cortex), new_rownames)
+```
+
+```{r}
+if(!requireNamespace("devtools", quietly = TRUE)) {
+  install.packages("devtools") 
+}
+
+devtools::install_github("saeyslab/nichenetr")
+library(nichenetr)
+
+```
+
+
+```{r}
+# Ensure gene_mapping has unique mouse gene names
+gene_mapping <- gene_mapping[!duplicated(gene_mapping$Mouse_Gene), ]
+
+exp_mtx <- as.matrix(human_cortex@assays$RNA@data)
+exp_mtx <- exp_mtx[gene_mapping$Human_Gene,]
+
+
+## Now chnage the rownames of the matrix to the mouse gene names
+rownames(exp_mtx) <- gene_mapping$Mouse_Gene
+
+# Create Seurat object with the renamed gene matrix
+human_cortex_renamed <- CreateSeuratObject(counts = exp_mtx, meta.data = human_cortex@meta.data)
+
+```
+
+
+
+# Preprocess our new seurat object of human cortex
+
+```{r}
+# Load required libraries
+#library(Seurat)
+#library(SingleCellExperiment)
+#library(celda)  # For decontX
+#library(scDblFinder)  # For doublet detection
+
+# Perform standard QC
+human_cortex_renamed[["percent.mito"]] <- PercentageFeatureSet(human_cortex_renamed, pattern = "^MT-")
+human_cortex_renamed <- subset(human_cortex_renamed, subset = nFeature_RNA > 200 & percent.mito < 15)
+
+rownames(human_cortex_renamed)
+
+# Convert to SingleCellExperiment and apply DecontX for contamination correction
+sce <- as.SingleCellExperiment(human_cortex_renamed)
+sce <- decontX(sce)
+human_cortex_renamed <- SetAssayData(human_cortex_renamed, assay = "RNA", layer = "counts", new.data = assays(sce)$decontXcounts)
+
+# Run scDblFinder for doublet detection and filter singlets
+sce <- scDblFinder(sce)
+human_cortex_renamed$scDblFinder_class <- sce$scDblFinder.class
+human_cortex_renamed <- subset(human_cortex_renamed, subset = scDblFinder_class == "singlet")
+
+# Normalize using SCTransform v2
+human_cortex_renamed <- SCTransform(human_cortex_renamed, vst.flavor = "v2", return.only.var.genes = FALSE, verbose = FALSE)
+
+# Perform Cell Cycle Scoring
+g2m.genes <- cell_cycle_genes[cell_cycle_genes$phase == "G2/M", ]$gene
+s.genes <- cell_cycle_genes[cell_cycle_genes$phase == "S", ]$gene
+human_cortex_renamed <- CellCycleScoring(
+  object = human_cortex_renamed,
+  s.features = s.genes[s.genes %in% rownames(human_cortex_renamed)],
+  g2m.features = g2m.genes[g2m.genes %in% rownames(human_cortex_renamed)],
+  set.ident = TRUE
+)
+
+# Run PCA and UMAP
+human_cortex_renamed <- RunPCA(human_cortex_renamed, npcs = 50, verbose = TRUE)
+human_cortex_renamed <- RunUMAP(human_cortex_renamed, dims = 1:10, verbose = TRUE)
+
+# Set default assay to SCT
+DefaultAssay(human_cortex_renamed) <- "SCT"
+
+# Save processed object to RDS
+saveRDS(human_cortex_renamed, file = "human_cortex_renamed_processed.rds")
+
+# View UMAP plot
+DimPlot(human_cortex_renamed, reduction = "umap")
+
+Idents(human_cortex_renamed) <- human_cortex_renamed$orig.ident
+
+VlnPlot(human_cortex_renamed, features = c("percent.hb", "percent.rb", "percent.mt"), ncol = 3)
+```
+
+```{r}
+human_cortex_renamed$scDblFinder_class %>% table
+```
+
+
+
+```{r, echo=FALSE, fig.height=5, fig.width=12}
+library(ggplot2)
+devtools::install_github('cttobin/ggthemr')
+library(ggthemr)
+
+n_cells <- merged_acomys_human$orig.ident %>% table %>% as.data.frame()
+colnames(n_cells) <- c("Sample", "Count")
+ggplot(n_cells, aes(Sample, Count)) + 
+  geom_col(fill = "#56B4E9") +
+  rotate_x_text(angle = 45) +
+  geom_text(aes(Sample, Count-222), label = n_cells$Count)
+```
+
+
+```{r}
+# check which genes we could not convert
+words <- rownames(human_cortex_renamed) %>% unique()
+
+# Keep only uppercase words
+upper_case_words <- words[sapply(words, function(word) word == toupper(word))]
+
+# Print the result
+print(upper_case_words)
+
+`%notin%` <- Negate(`%in%`)
+
+not_common_words <- words[sapply(words, function(word) word %notin% rownames(merged_integrated))]
+length(not_common_words)
+not_common_words
+```
+
+```{r}
+"Gabrg2" %in% rownames(merged_integrated)
+```
+
+
+```{r}
+# Extract cell names from both objects
+human_cells <- colnames(human_cortex_renamed)
+mouse_cells <- colnames(merged_acomys)
+
+# Find common cell names
+common_cells <- intersect(human_cells, mouse_cells)
+
+# Print the first few common cell names (if any)
+if (length(common_cells) > 0) {
+  cat("Common cell names found:\n")
+  print(head(common_cells))
+} else {
+  cat("No common cell names found between the two objects.\n")
+}
+
+# Check for duplicated cell names in human dataset
+human_duplicates <- human_cortex_renamed@meta.data[duplicated(rownames(human_cortex_renamed@meta.data)), ]
+if (nrow(human_duplicates) > 0) {
+  cat("Duplicate cell names found in human_cortex_renamed:\n")
+  print(head(rownames(human_duplicates)))
+} else {
+  cat("No duplicate cell names found in human_cortex_renamed.\n")
+}
+
+# Check for duplicated cell names in mouse dataset
+mouse_duplicates <- merged_acomys@meta.data[duplicated(rownames(merged_acomys@meta.data)), ]
+if (nrow(mouse_duplicates) > 0) {
+  cat("Duplicate cell names found in merged_acomys:\n")
+  print(head(rownames(mouse_duplicates)))
+} else {
+  cat("No duplicate cell names found in merged_acomys.\n")
+}
+```
+
+```{r}
+# Verify all objects exist in combined_list
+required_objects <- c('ET_177517', 'ET_177638', 'ET_177915', 'ET_177968', 'ET176844', 'ET176990', 'ET177121', 'ET177186', 'ET1777081', 'ET177766', 'ET177855', 'Ac_adreno_female_1', 'Ac_adreno_female_10', 'Ac_adreno_female_2', 'Ac_adreno_female_3', 'Ac_adreno_female_9', 'Ac_adreno_male_4', 'Ac_adreno_male_5', 'Ac_adreno_male_6', 'Ac_adreno_male_7', 'Ac_adreno_male_8')
+all(required_objects %in% names(combined_list))
+
+# Validate all objects are Seurat objects
+all(sapply(combined_list[required_objects], class) %>% grepl("Seurat", .))
+
+# Compare feature names across objects
+lapply(combined_list[required_objects], function(x) rownames(x[["RNA"]]))
+
+
+
+print(names(combined_list)) # Check available objects
+
+head(combined_list$ET_177517) # Check first object's structure
+
+# Compare features of the first two objects
+sum(rownames(combined_list$ET_177517) != rownames(combined_list$Ac_adreno_male_8))
+```
+
+```{r}
+# Compare gene names between human (reannotated) and mouse objects
+human_genes <- rownames(combined_list$ET_177517)
+mouse_genes <- rownames(combined_list$Ac_adreno_male_8)
+
+# Check if they are identical in order and content
+identical(human_genes, mouse_genes)  # Should return TRUE
+
+# Find mismatched genes
+#setdiff(human_genes, mouse_genes)
+setdiff(mouse_genes, human_genes)
+```
+
+
+```{r}
+# Split human and mouse datasets by sample identity (if needed)
+human_cortex_list <- SplitObject(human_cortex_renamed, split.by = "orig.ident")
+merged_acomys_list <- SplitObject(merged_acomys, split.by = "orig.ident")
+
+# Combine lists of Seurat objects
+combined_list <- c(human_cortex_list, merged_acomys_list)
+
+# Initialize with the first object
+merged_acomys_human <- combined_list[[1]]
+
+
+
+DefaultAssay(merged_acomys_human)
+
+# Merge the remaining objects one by one
+if (length(combined_list) > 1) {
+  merged_acomys_human <- combined_list[[1]]
+  for (i in 2:length(combined_list)) {
+    merged_acomys_human <- merge(merged_acomys_human, combined_list[[i]])
+  }
+} else {
+  merged_acomys_human <- combined_list[[1]]  # Directly assign if only one object
+}
+
+
+# direct merging 
+merged_acomys_human <- merge(combined_list$ET_177517, y = c(combined_list$ET_177638, combined_list$ET_177915, combined_list$ET_177968, combined_list$ET176844, combined_list$ET176990, combined_list$ET177121, combined_list$ET177186, combined_list$ET1777081, combined_list$ET177766, combined_list$ET177855, combined_list$Ac_adreno_female_1, combined_list$Ac_adreno_female_10, combined_list$Ac_adreno_female_2, combined_list$Ac_adreno_female_3, combined_list$Ac_adreno_female_9, combined_list$Ac_adreno_male_4, combined_list$Ac_adreno_male_5, combined_list$Ac_adreno_male_6, combined_list$Ac_adreno_male_7, combined_list$Ac_adreno_male_8))
+
+```
+
+
+```{r}
+merged_acomys_human$Species <- ifelse(str_detect(merged_acomys_human$orig.ident, "Ac_adreno"), "Acomys", "Human")
+
+merged_acomys_human$Species %>% table
+```
+
+
+```{r}
+rownames(merged_acomys_human)
+Idents(merged_acomys_human) <- merged_acomys_human$orig.ident
+
+# Run SCTransform
+merged_acomys_human <- SCTransform(merged_acomys_human, vst.flavor = "v2", )
+
+# Run PCA
+merged_acomys_human <- RunPCA(merged_acomys_human, npcs = 40, verbose = FALSE)
+
+# CCA Integration
+merged_acomys_human <- IntegrateLayers(
+  object = merged_acomys_human, method = CCAIntegration, assay = "SCT",
+  orig.reduction = "pca", new.reduction = "integrated.cca", normalization.method = "SCT",
+  verbose = TRUE
+)
+
+
+# Check the number of dimensions in the reduction
+ncol(merged_acomys_human@reductions$integrated.cca)
+
+# Find Neighbors and Clusters
+merged_acomys_human <- FindNeighbors(merged_acomys_human, reduction = "integrated.cca", dims = 1:40)
+merged_acomys_human <- FindClusters(merged_acomys_human, resolution = 0.3, cluster.name = "cca_clusters")
+
+# Run UMAP
+merged_acomys_human <- RunUMAP(merged_acomys_human, reduction = "integrated.cca", dims = 1:40, reduction.name = "umap.cca")
+
+saveRDS(merged_acomys_human, "merged_acomys_human.RDS")
+
+
+# Visualize
+DimPlot(merged_acomys_human, reduction = "umap.cca", label=T)
+```
+
+
+
+```{r, echo=FALSE, fig.height=5, fig.width=15}
+merged_acomys_human$seurat_clusters %>% table
+
+Idents(merged_acomys_human) <- merged_acomys_human$cca_clusters
+DimPlot(merged_acomys_human, reduction = "umap.cca")
+
+DimPlot(merged_acomys_human, reduction = "umap.cca", 
+        group.by = c("cca_clusters", "Species", "Phase"), shuffle =T)
+```
+
+```{r}
+DotPlot(merged_acomys_human, features = c("Cyp17a1", "Akr1c3", "Sult2a1"), cols = c("blue", "yellow"))
+```
+
+
+```{r}
+FeaturePlot(merged_acomys_human, features = c("Cyp17a1", "Sult2a1"), cols = c("blue", "yellow"), order = T)
+# Check co-expression of Cyp17a1 with other markers
+FeaturePlot(merged_acomys_human, features = c("Cyp17a1", "Akr1c3", "Cyp11b2", "Hsd3b2"))
+```
+
+
+
+```{r, echo=FALSE, fig.height=12, fig.width=12}
+
+FeaturePlot(merged_acomys_human, 
+            features = c("Vsnl1", "Ptch1", "Ptch2", "Ptch3"), 
+            reduction = "umap.cca",
+            split.by = "Species",
+            label = T, repel = T, 
+            pt.size = 0.9, 
+            label.size = 5, 
+            order = TRUE, keep.scale = "all", blend = F)
+```
+
+
+```{r}
+CellDimPlot3D(srt = merged_acomys_human, group.by = "Species")
+```
+
+```{r}
+# Check cell counts by species
+table(merged_acomys_human$Species)
+
+# Check cell counts by sample
+table(merged_acomys_human$orig.ident)
+
+df <- as.data.frame.table(table(merged_acomys_human$Species))
+
+# Rename columns for clarity
+colnames(df) <- c("Species", "Count")
+
+ggplot(df, aes(x = Species, y = Count, fill = Species)) +
+  geom_bar(stat = "identity")+
+  geom_text(aes(label = Count), vjust = -0.5, size = 4) +
+  labs(x = "Species",
+       y = "Number of Cells") 
+```
+
+
+
+
+# Plottinmg features
+
+
+```{r, echo=FALSE, fig.height=7, fig.width=12}
+FeatureDimPlot(
+  srt = merged_acomys_human, features = c("Mki67", "Gli1", "Top2a", "Dcn"),
+  reduction = "UMAP", theme_use = "theme_blank", split.by = "Species"
+)
+```
+
+```{r, echo=FALSE, fig.height=12, fig.width=12}
+
+# ZG (Zona Glomerulosa)
+FeatureDimPlot(
+  srt = merged_acomys_human, features = c("Cyp11b2", "Fdx1", "Hsd3b6", "Ly6d", "Vsnl1", "Steap1", "Ptn"),
+  reduction = "UMAP", theme_use = "theme_blank",  split.by = "Species"
+)
+
+Idents(merged_acomys_human) <- merged_acomys_human$cca_clusters
+# FeaturePlot(merged_acomys_human, 
+#             features = c("Cyp11b2", "Fdx1", "Hsd3b6", "Ly6d", "Vsnl1", "Steap1", "Ptn"), 
+#             reduction = "umap.cca",
+#             split.by = "Species",
+#             label = T, repel = T, 
+#             pt.size = 0.9, 
+#             label.size = 5, 
+#             order = T)
+```
+
+```{r, echo=FALSE, fig.height=12, fig.width=12}
+FeatureDimPlot(
+  srt = merged_acomys_human, features = c("Ccn3", "Dlk1", "Vcan"),
+  reduction = "UMAP", theme_use = "theme_blank", split.by = "Species"
+)
+```
+
+
+
+```{r, echo=FALSE, fig.height=12, fig.width=12}
+
+#Transitional Cells (between pericortex and cortex):
+#Rgs5 (regulator of G protein signaling 5)
+#Slpi (secretory leukocyte peptidase inhibitor)
+#Tfpi2 (tissue factor pathway inhibitor 2)
+#Usp53 (ubiquitin specific peptidase 53)
+
+
+FeatureDimPlot(
+  srt = merged_acomys_human, features = c("Rgs5", "Slpi", "Tfpi2", "Usp53"),
+  reduction = "UMAP", theme_use = "theme_blank", split.by = "Species"
+)
+
+```
+
+```{r, echo=FALSE, fig.height=15, fig.width=15}
+
+# Vascular Smooth Muscle Cells (VSMCs):
+# Acta2 (alpha smooth muscle actin)
+# Tagln (transgelin)
+# Rgs5 (regulator of G protein signaling 5)
+# Myh11 (myosin heavy chain 11)
+# Slpi (secretory leukocyte peptidase inhibitor)
+# Tfpi2 (tissue factor pathway inhibitor 2)
+
+
+FeatureDimPlot(
+  srt = merged_acomys_human, features = c("Acta2", "Tagln", "Rgs5", "Myh11", "Slpi", "Tfpi2"),
+  reduction = "UMAP", theme_use = "theme_blank", split.by = "Species"
+)
+
+```
+
+
+```{r, echo=FALSE, fig.height=12, fig.width=12}
+
+# Pericortical Mesenchymal Cells:
+# Sparcl1 (SPARC-like 1)
+# Col1a1 (collagen type I alpha 1 chain)
+# Col1a2 (collagen type I alpha 2 chain)
+# Wt1 (Wilms tumor 1)
+# Gli1 (GLI family zinc finger 1)
+# Ptch1 (patched 1)
+# Rspo3 (R-spondin 3)
+# Dcn (decorin)
+
+
+FeatureDimPlot(
+  srt = merged_acomys_human, features = c("Sparcl1", "Col1a1", "Col1a2", "Wt1", "Gli1", 
+                                      "Ptch1", "Rspo3", "Dcn"),
+  reduction = "UMAP", theme_use = "theme_blank", split.by = "Species"
+)
+
+```
+
+```{r, echo=FALSE, fig.height=12, fig.width=12}
+
+
+FeatureDimPlot(
+  srt = merged_acomys_human, features = c("Ccdc80", "Fbln1", "Fbn1", "Igfbp6", "Gsn", "Agtr1b"),
+  reduction = "UMAP", theme_use = "theme_blank", split.by = "Species"
+)
+
+```
+
+```{r, echo=FALSE, fig.height=12, fig.width=12}
+
+# Zona Glomerulosa (ZG):
+# Cyp11b2 (aldosterone synthase)
+# Fdx1 (ferredoxin 1)
+# Hsd3b6 (3-beta-hydroxysteroid dehydrogenase 6)
+# Ly6d (lymphocyte antigen 6 complex, locus D)
+# Vsnl1 (visinin-like 1)
+# Steap1 (STEAP family member 1)
+# Ptn (pleiotrophin)
+
+
+FeatureDimPlot(
+  srt = merged_acomys_human, features = c("Cyp11b2", "Fdx1", "Hsd3b6", "Ly6d", "Vsnl1", 
+                                      "Steap1", "Ptn"),
+  reduction = "UMAP", theme_use = "theme_blank", split.by = "Species"
+)
+
+```
+
+```{r, echo=FALSE, fig.height=12, fig.width=12}
+
+#ZF (Zona Fasciculata):
+#Cyp11b1 (11-beta-hydroxylase)
+#Akr1cl (aldo-keto reductase family 1, member C-like)
+#Abcb1b (ATP-binding cassette, sub-family B, member 1B)
+#Sbsn (subbasal zone protein)
+#Meg3 (maternally expressed 3)
+
+
+FeatureDimPlot(
+  srt = merged_acomys_human, features = c("Cyp11b1", "Akr1cl", "Abcb1b", "Sbsn", "Meg3"),
+  reduction = "UMAP", theme_use = "theme_blank", split.by = "Species"
+)
+
+```
+
+```{r, echo=FALSE, fig.height=12, fig.width=12}
+
+# X-Zone (Inner Cortex in Mice):
+# Cyp11b1 (11-beta-hydroxylase)
+# Cyp17a1 (17-alpha-hydroxylase)
+# Hsd3b6 (3-beta-hydroxysteroid dehydrogenase 6)
+# Sult2a1 (sulfotransferase family 2A member 1)
+
+
+FeatureDimPlot(
+  srt = merged_acomys_human, features = c("Cyp11b1", "Cyp17a1", "Hsd3b6", "Sult1e1", "Slc40a1", "Gsta3"),
+  reduction = "UMAP", theme_use = "theme_blank", split.by = "Species"
+)
+
+```
+
+
+
+
+```{r, echo=FALSE, fig.height=12, fig.width=12}
+
+# Adrenocortical Progenitors (in Cortex):
+# Nr5a1 (nuclear receptor subfamily 5 group A member 1)
+# Shh (sonic hedgehog)
+# Wnt4 (Wnt family member 4)
+# Ezh2 (enhancer of zeste 2 polycomb repressive complex 2 subunit)
+# Cenpm (centromere protein M)
+# H2afx (H2A histone family member X)
+# Stmn1 (stathmin 1)
+
+FeatureDimPlot(
+  srt = merged_acomys_human, features = c("Nr5a1", "Shh", "Wnt4", "Ezh2", "Cenpm", "H2afx", "Stmn1"),
+  reduction = "UMAP", theme_use = "theme_blank", split.by = "Species"
+)
+
+```
+
+```{r, echo=FALSE, fig.height=7, fig.width=7}
+
+FeatureDimPlot(
+  srt = merged_acomys_human, features = c("Shh", "Wnt4"),
+  reduction = "UMAP", theme_use = "theme_blank", split.by = "Species"
+)
+```
+
+

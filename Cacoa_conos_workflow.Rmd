@@ -1,0 +1,64 @@
+---
+title: "Cacoa_conos_workflows"
+author: "Andrey Bydanov"
+date: "2024-12-16"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+Try to implement cacoa workflow
+```{r}
+#install.packages('devtools')
+devtools::install_github('kharchenkolab/cacoa')
+```
+
+
+```{r}
+#BiocManager::install(c("clusterProfiler", "DESeq2", "DOSE", "EnhancedVolcano", "enrichplot", "fabia", "GOfuncR", "Rgraphviz"))
+library("clusterProfiler")
+library(DESeq2)
+library(DOSE)
+library(EnhancedVolcano)
+library(enrichplot)
+library(fabia)
+library(GOfuncR)
+library(Rgraphviz)
+```
+
+
+Male object
+
+```{r}
+cao <- Cacoa$new(
+    merged_male_integrated, sample.groups=sample.groups, cell.groups=cell.groups, sample.per.cell=sample.per.cell, 
+    ref.level=ref.level, target.level=target.level, graph.name=graph.name, data.slot='data'
+)
+```
+
+
+
+######################
+
+Conos pipeline
+
+######################
+
+```{r}
+install.packages("renv")
+renv::init()
+```
+
+
+```{r}
+renv::install("leidenAlg")
+#install.packages('devtools')
+install.packages('conos')
+```
+
+
+
+
+
